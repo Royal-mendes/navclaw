@@ -13,11 +13,24 @@ CONTAINER="${NAVCLAW_CONTAINER:-navclaw-ep${EPISODE}-${TIMESTAMP}}"
 NAV_RUN_DIR="${ROOT}/runs/${RUN_ID}"
 MAPGPT_RUN_DIR="${MAPGPT_ROOT}/logs/${RUN_ID}"
 PORT="${NAVCLAW_PORT:-8765}"
+SELECTOR_PATH="/workspace/navclaw/bridge/frontier_only_selector.py"
+CANDIDATE_POLICY="original_frontier_only"
+STOP_POLICY="verified_vlm_stop_request_v1"
+REBUILD_LOWER="${NAVCLAW_REBUILD_LOWER:-1}"
+STOP_MIN_SCORE="${NAVCLAW_STOP_MIN_TARGET_SCORE:-0.65}"
+STOP_MAX_DISTANCE="${NAVCLAW_STOP_MAX_DISTANCE_M:-1.0}"
+STOP_MIN_OBSERVATIONS="${NAVCLAW_STOP_MIN_OBSERVATIONS:-2}"
+STOP_HALF_FOV="${NAVCLAW_STOP_HALF_FOV_DEG:-39.5}"
 
 mkdir -p "${NAV_RUN_DIR}" "${MAPGPT_RUN_DIR}"
 printf '%s\n' "${CONTAINER}" > "${NAV_RUN_DIR}/container_name.txt"
 printf '%s\n' "${RUN_ID}" > "${NAV_RUN_DIR}/run_id.txt"
 printf '%s\n' "${MAPGPT_RUN_DIR}" > "${NAV_RUN_DIR}/mapgpt_log_dir.txt"
+printf '%s\n' "${CANDIDATE_POLICY}" > "${NAV_RUN_DIR}/candidate_policy.txt"
+printf '%s\n' "${STOP_POLICY}" > "${NAV_RUN_DIR}/stop_policy.txt"
+
+python3 "${ROOT}/scripts/apply_verified_stop_patch.py" \
+  --root "${MAPGPT_ROOT}" > "${NAV_RUN_DIR}/verified_stop_patch.json"
 
 export NAVCLAW_RUN_ID="${RUN_ID}"
 export NAVCLAW_RUN_DIR="${NAV_RUN_DIR}/brain"
@@ -44,11 +57,15 @@ docker run -d \
   -e TRANSFORMERS_CACHE=/workspace/Agent-apexnav/third_party/hf_cache \
   -e APEXNAV_DATA_DIR=/workspace/Agent-apexnav/data \
   -e APEXNAV_VLM_DEBUG_DIR=/workspace/Agent-apexnav/debug \
-  -e APEXNAV_VLM_SELECTOR_SCRIPT=/workspace/navclaw/bridge/selector_client.py \
-  -e APEXNAV_VLM_FRONTIER_ONLY_CANDIDATES="${APEXNAV_VLM_FRONTIER_ONLY_CANDIDATES:-0}" \
+  -e APEXNAV_VLM_SELECTOR_SCRIPT="${SELECTOR_PATH}" \
+  -e APEXNAV_VLM_FRONTIER_ONLY_CANDIDATES=1 \
   -e NAVCLAW_SERVER_URL="http://127.0.0.1:${PORT}/decide" \
   -e NAVCLAW_SESSION_ID="${RUN_ID}:ep${EPISODE}" \
   -e NAVCLAW_BRIDGE_TIMEOUT="${NAVCLAW_BRIDGE_TIMEOUT:-900}" \
+  -e NAVCLAW_STOP_MIN_TARGET_SCORE="${STOP_MIN_SCORE}" \
+  -e NAVCLAW_STOP_MAX_DISTANCE_M="${STOP_MAX_DISTANCE}" \
+  -e NAVCLAW_STOP_MIN_OBSERVATIONS="${STOP_MIN_OBSERVATIONS}" \
+  -e NAVCLAW_STOP_HALF_FOV_DEG="${STOP_HALF_FOV}" \
   -e REPO_ROOT=/workspace/Agent-apexnav \
   -e APEXNAV_RUN_ID="${RUN_ID}" \
   -e APEXNAV_BATCH_LOG_DIR="/workspace/Agent-apexnav/logs/${RUN_ID}" \
@@ -59,14 +76,34 @@ docker run -d \
   bash -lc "
     set -euo pipefail
     cd /workspace/Agent-apexnav
+    source /opt/ros/noetic/setup.bash
+    if [[ '${REBUILD_LOWER}' == '1' ]]; then
+      if command -v catkin >/dev/null 2>&1; then
+        catkin build exploration_manager --no-status --jobs 2
+      elif command -v catkin_make >/dev/null 2>&1; then
+        catkin_make --pkg exploration_manager -j2
+      else
+        echo 'No catkin build command is available for verified STOP patch' >&2
+        exit 1
+      fi
+    else
+      echo 'NAVCLAW_REBUILD_LOWER=0: using an already rebuilt lower planner' >&2
+    fi
+    if [[ -f devel/setup.bash ]]; then
+      source devel/setup.bash
+    fi
     export REPO_ROOT=/workspace/Agent-apexnav
     export APEXNAV_RUN_ID='${RUN_ID}'
     export APEXNAV_BATCH_LOG_DIR='/workspace/Agent-apexnav/logs/${RUN_ID}'
-    export APEXNAV_VLM_SELECTOR_SCRIPT=/workspace/navclaw/bridge/selector_client.py
-    export APEXNAV_VLM_FRONTIER_ONLY_CANDIDATES='${APEXNAV_VLM_FRONTIER_ONLY_CANDIDATES:-0}'
+    export APEXNAV_VLM_SELECTOR_SCRIPT='${SELECTOR_PATH}'
+    export APEXNAV_VLM_FRONTIER_ONLY_CANDIDATES=1
     export NAVCLAW_SERVER_URL='http://127.0.0.1:${PORT}/decide'
     export NAVCLAW_SESSION_ID='${RUN_ID}:ep${EPISODE}'
     export NAVCLAW_BRIDGE_TIMEOUT='${NAVCLAW_BRIDGE_TIMEOUT:-900}'
+    export NAVCLAW_STOP_MIN_TARGET_SCORE='${STOP_MIN_SCORE}'
+    export NAVCLAW_STOP_MAX_DISTANCE_M='${STOP_MAX_DISTANCE}'
+    export NAVCLAW_STOP_MIN_OBSERVATIONS='${STOP_MIN_OBSERVATIONS}'
+    export NAVCLAW_STOP_HALF_FOV_DEG='${STOP_HALF_FOV}'
     export APEXNAV_VLM_MODEL='${APEXNAV_VLM_MODEL:-gpt-5.4}'
     export APEXNAV_VLM_REQUIRE_MODEL_DECISION=1
     export APEXNAV_VLM_REQUIRE_SUCCESS=1
@@ -90,5 +127,7 @@ docker run -d \
 docker inspect --format '{{.State.Status}} pid={{.State.Pid}}' "${CONTAINER}" \
   > "${NAV_RUN_DIR}/container_launch_state.txt"
 echo "NavClaw episode launched run_id=${RUN_ID} container=${CONTAINER}"
+echo "candidate_policy=${CANDIDATE_POLICY}"
+echo "stop_policy=${STOP_POLICY}"
 echo "brain_logs=${NAV_RUN_DIR}/brain"
 echo "navigation_logs=${MAPGPT_RUN_DIR}"

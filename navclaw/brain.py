@@ -9,7 +9,12 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .contracts import ContractError, extract_json_object, normalize_agent_action
+from .contracts import (
+    ContractError,
+    extract_json_object,
+    normalize_agent_action,
+    normalize_execution_feedback,
+)
 from .llm_client import LLMClient, LLMError
 from .memory import SessionMemory
 from .skills import SkillRegistry
@@ -67,18 +72,15 @@ You operate in a strict observe-think-act loop. Return exactly one action for th
 You may use only a skill listed in CURRENT_SKILLS. Candidate IDs are ephemeral: a waypoint may be selected only when its exact ID is listed in CURRENT_CANDIDATES for this observation.
 Never output coordinates, safe_goal values, old candidate IDs, MapGPT Place IDs, PX4/AirSim actions, or an unlisted skill.
 Do not claim task completion. The environment owns success detection. Do not use deterministic or geometric fallback reasoning.
+RECENT_EXECUTION_MEMORY contains observed lower-layer outcomes when available. Treat reached and stalled_or_aborted as environment evidence, not as model speculation.
 Return exactly one object in json format with this schema:
 {"thinking":"brief first-person reasoning","decision":"act","action":{"skill":"one listed skill","parameters":{}},"reflection":"lesson from prior execution or null","goal_progress":"brief status","confidence":0.0}
-For select_waypoint, parameters must be {"candidate_id":"one exact current ID"}. LOOK skills take empty parameters.
+For select_waypoint, parameters must be {"candidate_id":"one exact current ID"}. LOOK and STOP skills take empty parameters. Do not add any other fields.
 """
         if self._profiles.get("SOUL.md"):
             system_prompt += "\nIDENTITY:\n" + self._profiles["SOUL.md"]
         if self._profiles.get("BODY.md"):
             system_prompt += "\nCAPABILITY_BOUNDARY:\n" + self._profiles["BODY.md"]
-        # Some OpenAI-compatible gateways validate json_object mode against user
-        # input only and do not count the system instruction. Keep the lowercase
-        # keyword here so the exact request accepted by the gateway states the
-        # structured-output contract without changing the allowed action space.
         user_text = "Return exactly one object in json format for this observation.\n" + json.dumps(
             {
                 "CURRENT_OBSERVATION": observation,
@@ -97,8 +99,8 @@ For select_waypoint, parameters must be {"candidate_id":"one exact current ID"}.
                     {
                         "type": "text",
                         "text": (
-                            "Current annotated RGB observation. Only labels whose IDs also appear "
-                            "in CURRENT_CANDIDATES are selectable."
+                            "Current annotated RGB observation. Every drawn waypoint label is also "
+                            "present in CURRENT_CANDIDATES, and no other waypoint is selectable."
                         ),
                     },
                     {"type": "image_url", "image_url": {"url": image_data_uri}},
@@ -115,6 +117,18 @@ For select_waypoint, parameters must be {"candidate_id":"one exact current ID"}.
         observation = payload.get("observation")
         if not isinstance(observation, dict):
             raise DecisionError("observation_must_be_object")
+
+        feedback_recorded = False
+        normalized_feedback = None
+        if payload.get("execution_feedback") is not None:
+            try:
+                normalized_feedback = normalize_execution_feedback(payload["execution_feedback"])
+            except ContractError as exc:
+                raise DecisionError(str(exc)) from exc
+            if normalized_feedback.get("next_request_id") != request_id:
+                raise DecisionError("execution_feedback_next_request_id_mismatch")
+            feedback_recorded = self.memory.append_feedback(session_id, normalized_feedback)
+
         candidates = observation.get("candidates") or []
         candidate_ids = [str(candidate.get("id")) for candidate in candidates if candidate.get("id")]
         allow_stop = bool(payload.get("allow_stop", False))
@@ -163,9 +177,12 @@ For select_waypoint, parameters must be {"candidate_id":"one exact current ID"}.
                         "request_body_sha256": body_hash,
                         "current_candidate_ids": candidate_ids,
                         "force_select_waypoint": force_select_waypoint,
+                        "execution_feedback_received": normalized_feedback is not None,
+                        "execution_feedback_recorded": feedback_recorded,
                     }
                 )
                 record = {
+                    "event_type": "decision",
                     "status": "ok",
                     "request_id": request_id,
                     "session_id": session_id,
@@ -179,28 +196,32 @@ For select_waypoint, parameters must be {"candidate_id":"one exact current ID"}.
                     "raw_model_output": raw,
                     "result": result,
                     "failures_before_success": failures,
+                    "execution_feedback": normalized_feedback,
                     "fallback": False,
                 }
                 self._append_decision_log(record)
                 self.memory.append(session_id, record)
                 return result
             except (ContractError, json.JSONDecodeError, DecisionError) as exc:
-                failure = {
-                    "decision_attempt": decision_attempt,
-                    "kind": "invalid_model_action",
-                    "error": str(exc),
-                    "raw_model_output": raw[:4000],
-                }
-                failures.append(failure)
+                failures.append(
+                    {
+                        "decision_attempt": decision_attempt,
+                        "kind": "invalid_model_action",
+                        "error": str(exc),
+                        "raw_model_output": raw[:4000],
+                    }
+                )
             except LLMError as exc:
-                failure = {
-                    "decision_attempt": decision_attempt,
-                    "kind": "llm_error",
-                    "error": str(exc),
-                }
-                failures.append(failure)
+                failures.append(
+                    {
+                        "decision_attempt": decision_attempt,
+                        "kind": "llm_error",
+                        "error": str(exc),
+                    }
+                )
 
         record = {
+            "event_type": "decision",
             "status": "error",
             "request_id": request_id,
             "session_id": session_id,
@@ -210,6 +231,7 @@ For select_waypoint, parameters must be {"candidate_id":"one exact current ID"}.
             "force_select_waypoint": force_select_waypoint,
             "request_body_sha256": request_body_hash,
             "failures": failures,
+            "execution_feedback": normalized_feedback,
             "fallback": False,
             "error": "no_valid_model_action_after_attempts",
             "created_at": time.time(),

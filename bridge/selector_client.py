@@ -7,6 +7,7 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import mimetypes
 import os
 import sys
@@ -23,8 +24,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from navclaw.contracts import (  # noqa: E402
     ContractError,
     compact_observation,
-    normalize_agent_action,
-    selectable_candidates,
+    filter_selectable_candidates,
+    projection_xy,
 )
 
 
@@ -72,6 +73,81 @@ def request_id_from_output(output_path):
     return name[: -len(suffix)] if name.endswith(suffix) else Path(name).stem
 
 
+def safe_session_id(session_id):
+    cleaned = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in session_id)
+    return cleaned[:120] or "unknown"
+
+
+def resolve_session_id(args):
+    return (
+        args.session_id
+        or os.getenv("NAVCLAW_SESSION_ID", "")
+        or "episode_{0}".format(args.episode)
+    )
+
+
+def _finite_xy(value):
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return None
+    try:
+        x = float(value[0])
+        y = float(value[1])
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(x) or not math.isfinite(y):
+        return None
+    return [x, y]
+
+
+def robot_xy(candidate_data):
+    robot = candidate_data.get("robot") or {}
+    return _finite_xy([robot.get("x"), robot.get("y")])
+
+
+def _projection_in_bounds(candidate, width, height):
+    projection = projection_xy(candidate)
+    if projection is None:
+        return False
+    x, y = projection
+    return 0.0 <= x < float(width) and 0.0 <= y < float(height)
+
+
+def renderable_candidates(candidate_data, image_path):
+    """Return the exact original records that can be drawn and selected."""
+
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("pillow_required_for_candidate_validation") from exc
+
+    base_candidates = filter_selectable_candidates(candidate_data.get("candidates") or [])
+    views = candidate_data.get("panorama_views") or []
+    if len(views) >= 2:
+        dimensions = {}
+        for index, view in enumerate(views):
+            view_id = str(view.get("view_id") or "P{0}".format(index + 1))
+            raw_path = Path(str(view.get("raw_image") or view.get("image_path") or ""))
+            if not raw_path.exists():
+                continue
+            with Image.open(str(raw_path)) as image:
+                dimensions[view_id] = image.size
+        selected = []
+        for candidate in base_candidates:
+            view_id = str(candidate.get("view_id") or "")
+            size = dimensions.get(view_id)
+            if size and _projection_in_bounds(candidate, size[0], size[1]):
+                selected.append(candidate)
+        return selected
+
+    with Image.open(str(image_path)) as image:
+        width, height = image.size
+    return [
+        candidate
+        for candidate in base_candidates
+        if _projection_in_bounds(candidate, width, height)
+    ]
+
+
 def annotate_current_image(image_path, output_path, candidates):
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -82,13 +158,12 @@ def annotate_current_image(image_path, output_path, candidates):
     draw = ImageDraw.Draw(image)
     font = ImageFont.load_default()
     for candidate in candidates:
-        projection = candidate.get("projection")
-        if not isinstance(projection, (list, tuple)) or len(projection) < 2:
+        projection = projection_xy(candidate)
+        if projection is None:
             continue
-        try:
-            x = int(round(float(projection[0])))
-            y = int(round(float(projection[1])))
-        except (TypeError, ValueError):
+        x = int(round(projection[0]))
+        y = int(round(projection[1]))
+        if x < 0 or y < 0 or x >= image.width or y >= image.height:
             continue
         label = str(candidate.get("id") or "")
         radius = 14
@@ -125,13 +200,12 @@ def compose_panorama(candidate_data, output_path):
         image = Image.open(str(raw_path)).convert("RGB")
         draw = ImageDraw.Draw(image)
         for candidate in panel_candidates:
-            projection = candidate.get("projection")
-            if not isinstance(projection, (list, tuple)) or len(projection) < 2:
+            projection = projection_xy(candidate)
+            if projection is None:
                 continue
-            try:
-                x = int(round(float(projection[0])))
-                y = int(round(float(projection[1])))
-            except (TypeError, ValueError):
+            x = int(round(projection[0]))
+            y = int(round(projection[1]))
+            if x < 0 or y < 0 or x >= image.width or y >= image.height:
                 continue
             label = str(candidate.get("id") or "")
             draw.ellipse((x - 14, y - 14, x + 14, y + 14), outline=(0, 255, 0), width=4)
@@ -176,7 +250,87 @@ def encode_data_uri(path):
     return "data:{0};base64,{1}".format(mime, encoded)
 
 
-def build_payload(args, candidate_data, image_path):
+def bridge_state_path(output_path, session_id):
+    configured = os.getenv("NAVCLAW_BRIDGE_STATE_DIR", "").strip()
+    root = Path(configured) if configured else Path(output_path).parent / ".navclaw_state"
+    return root / (safe_session_id(session_id) + ".json")
+
+
+def load_bridge_state(path):
+    path = Path(path)
+    if not path.exists():
+        return {"version": 1, "pending_waypoint": None}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"version": 1, "pending_waypoint": None}
+    return value if isinstance(value, dict) else {"version": 1, "pending_waypoint": None}
+
+
+def reached_threshold():
+    try:
+        value = float(os.getenv("NAVCLAW_WAYPOINT_REACHED_THRESHOLD", "0.25"))
+    except ValueError:
+        value = 0.25
+    return max(0.05, min(1.0, value))
+
+
+def build_execution_feedback(state, candidate_data, current_request_id):
+    pending = state.get("pending_waypoint") if isinstance(state, dict) else None
+    if not isinstance(pending, dict):
+        return None
+    previous_request_id = str(pending.get("request_id") or "")
+    selected_id = str(pending.get("selected_id") or "")
+    if not previous_request_id or not selected_id or previous_request_id == current_request_id:
+        return None
+
+    current_xy = robot_xy(candidate_data)
+    start_xy = _finite_xy(pending.get("start_robot_xy"))
+    safe_goal = _finite_xy(pending.get("safe_goal"))
+    threshold = float(pending.get("reached_threshold_m") or reached_threshold())
+    final_distance = None
+    start_distance = None
+    travel_distance = None
+    outcome = "unknown"
+    if current_xy is not None and safe_goal is not None:
+        final_distance = math.hypot(current_xy[0] - safe_goal[0], current_xy[1] - safe_goal[1])
+        outcome = "reached" if final_distance <= threshold else "stalled_or_aborted"
+    if start_xy is not None and safe_goal is not None:
+        start_distance = math.hypot(start_xy[0] - safe_goal[0], start_xy[1] - safe_goal[1])
+    if start_xy is not None and current_xy is not None:
+        travel_distance = math.hypot(current_xy[0] - start_xy[0], current_xy[1] - start_xy[1])
+
+    observed_at = time.time()
+    issued_at = pending.get("issued_at")
+    elapsed_s = None
+    if isinstance(issued_at, (int, float)) and math.isfinite(float(issued_at)):
+        elapsed_s = max(0.0, observed_at - float(issued_at))
+    feedback_id = hashlib.sha256(
+        (previous_request_id + "\0" + current_request_id + "\0" + selected_id).encode("utf-8")
+    ).hexdigest()
+    feedback = {
+        "feedback_id": feedback_id,
+        "request_id": previous_request_id,
+        "next_request_id": current_request_id,
+        "selected_id": selected_id,
+        "execution_outcome": outcome,
+        "source": "bridge_next_decision_observation",
+        "reached_threshold_m": threshold,
+        "issued_step": pending.get("step"),
+        "observed_step": candidate_data.get("step"),
+    }
+    if final_distance is not None:
+        feedback["final_distance_m"] = final_distance
+    if start_distance is not None:
+        feedback["start_distance_m"] = start_distance
+    if travel_distance is not None:
+        feedback["travel_distance_m"] = travel_distance
+    if elapsed_s is not None:
+        feedback["elapsed_s"] = elapsed_s
+    return feedback
+
+
+def build_payload(args, candidate_data, image_path, execution_feedback=None):
     candidate_data = dict(candidate_data)
     candidate_data["target"] = args.target or candidate_data.get("target") or "unknown"
     candidate_data["episode"] = args.episode
@@ -186,15 +340,9 @@ def build_payload(args, candidate_data, image_path):
     if args.instruction:
         candidate_data["instruction"] = args.instruction
     observation = compact_observation(candidate_data)
-    request_id = request_id_from_output(args.output_json)
-    session_id = (
-        args.session_id
-        or os.getenv("NAVCLAW_SESSION_ID", "")
-        or "episode_{0}".format(args.episode)
-    )
-    return {
-        "request_id": request_id,
-        "session_id": session_id,
+    payload = {
+        "request_id": request_id_from_output(args.output_json),
+        "session_id": resolve_session_id(args),
         "observation": observation,
         "image_data_uri": encode_data_uri(image_path),
         "allow_stop": bool(args.allow_stop),
@@ -202,6 +350,9 @@ def build_payload(args, candidate_data, image_path):
         or str(candidate_data.get("mode") or args.mode) == "vlm_scan_full_circle_choice",
         "strict_no_fallback": True,
     }
+    if execution_feedback is not None:
+        payload["execution_feedback"] = execution_feedback
+    return payload
 
 
 def post_decision(url, payload, timeout):
@@ -211,7 +362,7 @@ def post_decision(url, payload, timeout):
     request = urllib.request.Request(
         url,
         data=body,
-        headers={"Content-Type": "application/json", "User-Agent": "NavClawBridge/0.1"},
+        headers={"Content-Type": "application/json", "User-Agent": "NavClawBridge/0.2"},
         method="POST",
     )
     try:
@@ -244,11 +395,39 @@ def validate_cpp_result(result, candidate_ids, allow_stop=False, force_select_wa
         if selected not in (None, ""):
             raise ContractError("look_action_must_not_select_candidate")
     elif decision == "STOP" and allow_stop:
-        pass
+        if selected not in (None, ""):
+            raise ContractError("stop_action_must_not_select_candidate")
     else:
         raise ContractError("bridge_received_unknown_decision")
     if force_select_waypoint and decision != "SELECT_WAYPOINT":
         raise ContractError("bridge_full_scan_requires_waypoint")
+
+
+def pending_waypoint_from_result(result, candidate_data, request_id, threshold):
+    if result.get("decision") != "SELECT_WAYPOINT":
+        return None
+    selected_id = str(result.get("selected") or "")
+    selected = next(
+        (
+            candidate
+            for candidate in candidate_data.get("candidates") or []
+            if str(candidate.get("id") or "") == selected_id
+        ),
+        None,
+    )
+    if not isinstance(selected, dict):
+        return None
+    return {
+        "request_id": request_id,
+        "selected_id": selected_id,
+        "safe_goal": _finite_xy(selected.get("safe_goal")),
+        "start_robot_xy": robot_xy(candidate_data),
+        "target": candidate_data.get("target"),
+        "episode": candidate_data.get("episode"),
+        "step": candidate_data.get("step"),
+        "issued_at": time.time(),
+        "reached_threshold_m": threshold,
+    }
 
 
 def run(args):
@@ -258,8 +437,11 @@ def run(args):
     if output_path.exists():
         output_path.unlink()
     candidate_data = json.loads(candidate_path.read_text(encoding="utf-8"))
-    valid = selectable_candidates(candidate_data.get("candidates") or [])
-    valid_ids = [item["id"] for item in valid]
+
+    exact_candidates = renderable_candidates(candidate_data, image_path)
+    candidate_data = dict(candidate_data)
+    candidate_data["candidates"] = exact_candidates
+    valid_ids = [str(item.get("id")) for item in exact_candidates]
 
     if args.image_already_annotated:
         decision_image = image_path
@@ -274,10 +456,15 @@ def run(args):
             decision_image = annotate_current_image(
                 image_path,
                 annotation_path,
-                candidate_data.get("candidates") or [],
+                exact_candidates,
             )
 
-    payload = build_payload(args, candidate_data, decision_image)
+    request_id = request_id_from_output(output_path)
+    session_id = resolve_session_id(args)
+    state_path = bridge_state_path(output_path, session_id)
+    state = load_bridge_state(state_path)
+    execution_feedback = build_execution_feedback(state, candidate_data, request_id)
+    payload = build_payload(args, candidate_data, decision_image, execution_feedback)
     result, bridge_request_hash = post_decision(args.server_url, payload, args.timeout)
     validate_cpp_result(
         result,
@@ -285,6 +472,22 @@ def run(args):
         allow_stop=args.allow_stop,
         force_select_waypoint=bool(payload.get("force_select_waypoint")),
     )
+
+    threshold = reached_threshold()
+    new_pending = pending_waypoint_from_result(
+        result, candidate_data, request_id, threshold
+    )
+    write_json_atomic(
+        state_path,
+        {
+            "version": 1,
+            "session_id": session_id,
+            "pending_waypoint": new_pending,
+            "last_execution_feedback": execution_feedback,
+            "updated_at": time.time(),
+        },
+    )
+
     result.update(
         {
             "target": args.target,
@@ -295,6 +498,7 @@ def run(args):
             "annotated_image": str(decision_image),
             "visible_candidate_count": len(valid_ids),
             "current_candidate_ids": valid_ids,
+            "execution_feedback": execution_feedback,
             "bridge_request_sha256": bridge_request_hash,
             "created_at": time.time(),
         }
@@ -307,10 +511,13 @@ def run(args):
         bridge_log,
         {
             "status": "ok",
-            "request_id": request_id_from_output(output_path),
+            "request_id": request_id,
+            "session_id": session_id,
             "candidate_json": str(candidate_path),
             "decision_image": str(decision_image),
             "valid_candidate_ids": valid_ids,
+            "execution_feedback": execution_feedback,
+            "pending_waypoint": new_pending,
             "result": result,
             "fallback": False,
         },
