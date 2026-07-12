@@ -4,7 +4,7 @@ NavClaw keeps movement strictly original-frontier-only while treating STOP as a 
 
 ## Gate
 
-`bridge/frontier_only_selector.py` calls `navclaw.stop_gate.evaluate_stop_gate` on the lower-layer candidate JSON. STOP is added to `CURRENT_SKILLS` only when one target-matching detector record satisfies all configured checks:
+`bridge/frontier_only_selector.py` calls `navclaw.stop_gate.evaluate_stop_gate` on the lower-layer candidate JSON. The lower ObjectMap2D labels target-class clusters as `target:<category>`; the gate normalizes that prefix before category matching. STOP is added to `CURRENT_SKILLS` only when one target-matching detector record satisfies all configured checks:
 
 - target category matches the task target;
 - `target_score >= NAVCLAW_STOP_MIN_TARGET_SCORE` (default `0.65`);
