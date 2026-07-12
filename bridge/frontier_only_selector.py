@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Strict original-frontier-only entrypoint for the NavClaw selector bridge.
-
-The lower planner may still emit diagnostic or recovery candidates, but this
-entrypoint removes every candidate whose source is not exactly ``frontier``
-before annotation, prompt construction, validation, and execution-feedback
-tracking. The filtered JSON is retained beside the selector output for audit.
-"""
+"""Strict original-frontier-only entrypoint with verified STOP gating."""
 
 from __future__ import print_function
 
@@ -19,6 +13,13 @@ from typing import Any, Dict, Iterable, List, Sequence
 
 
 BRIDGE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BRIDGE_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from navclaw.stop_gate import evaluate_stop_gate  # noqa: E402
+
+
 SELECTOR_CLIENT = BRIDGE_DIR / "selector_client.py"
 ORIGINAL_FRONTIER_SOURCE = "frontier"
 POLICY_NAME = "original_frontier_only"
@@ -35,14 +36,10 @@ def write_json_atomic(path: Path, payload: Dict[str, Any]) -> None:
     os.replace(str(temporary), str(path))
 
 
-def original_frontier_candidates(candidates: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Keep only unmodified planner frontiers.
-
-    Exact source matching is intentional. Derived candidates such as
-    ``frontier_cluster_average``, ``frontier_cluster_sample``,
-    ``frontier_cluster_endpoint``, and ``frontier_slid`` are excluded together
-    with local-view, connector, target, recovery, and emergency proxies.
-    """
+def original_frontier_candidates(
+    candidates: Iterable[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Keep only unmodified planner frontiers."""
 
     return [
         candidate
@@ -58,7 +55,10 @@ def discarded_source_counts(candidates: Iterable[Dict[str, Any]]) -> Dict[str, i
         if not isinstance(candidate, dict):
             source = "invalid_record"
         else:
-            source = str(candidate.get("source") or "missing_source").strip() or "missing_source"
+            source = (
+                str(candidate.get("source") or "missing_source").strip()
+                or "missing_source"
+            )
         if source == ORIGINAL_FRONTIER_SOURCE:
             continue
         counts[source] = counts.get(source, 0) + 1
@@ -84,6 +84,15 @@ def replace_cli_option(argv: Sequence[str], option: str, value: str) -> List[str
     return rewritten
 
 
+def set_cli_flag(argv: Sequence[str], flag: str, enabled: bool) -> List[str]:
+    """Set one boolean CLI flag without allowing duplicate stale values."""
+
+    rewritten = [value for value in argv if value != flag]
+    if enabled:
+        rewritten.append(flag)
+    return rewritten
+
+
 def patch_audit_artifact(
     path: Path,
     source_candidate_json: Path,
@@ -91,6 +100,7 @@ def patch_audit_artifact(
     original_count: int,
     kept_count: int,
     discarded_sources: Dict[str, int],
+    stop_gate: Dict[str, Any],
 ) -> None:
     if not path.exists():
         return
@@ -107,7 +117,8 @@ def patch_audit_artifact(
     payload["kept_original_frontier_count"] = kept_count
     payload["discarded_candidate_count"] = max(0, original_count - kept_count)
     payload["discarded_candidate_sources"] = discarded_sources
-    # Keep candidate_json user-facing as the original lower-layer artifact.
+    payload["stop_gate"] = stop_gate
+    payload["stop_request_enabled"] = bool(stop_gate.get("eligible"))
     payload["candidate_json"] = str(source_candidate_json)
     write_json_atomic(path, payload)
 
@@ -136,6 +147,7 @@ def main(argv: Sequence[str] = None) -> int:
     original_candidates = source_data.get("candidates") or []
     kept_candidates = original_frontier_candidates(original_candidates)
     discarded_sources = discarded_source_counts(original_candidates)
+    stop_gate = evaluate_stop_gate(source_data)
 
     filtered_data = dict(source_data)
     filtered_data["candidates"] = kept_candidates
@@ -146,11 +158,15 @@ def main(argv: Sequence[str] = None) -> int:
         "kept_candidate_count": len(kept_candidates),
         "discarded_candidate_sources": discarded_sources,
     }
+    filtered_data["stop_gate"] = stop_gate
 
     filtered_path = filtered_json_path(source_candidate_path, output_path)
     write_json_atomic(filtered_path, filtered_data)
 
     rewritten_argv = replace_cli_option(argv, "--candidate-json", str(filtered_path))
+    rewritten_argv = set_cli_flag(
+        rewritten_argv, "--allow-stop", bool(stop_gate.get("eligible"))
+    )
     completed = subprocess.run([sys.executable, str(SELECTOR_CLIENT)] + rewritten_argv)
 
     bridge_log = output_path.with_name(
@@ -165,6 +181,7 @@ def main(argv: Sequence[str] = None) -> int:
             len(original_candidates),
             len(kept_candidates),
             discarded_sources,
+            stop_gate,
         )
     return int(completed.returncode)
 
