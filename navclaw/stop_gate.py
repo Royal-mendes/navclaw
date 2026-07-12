@@ -16,8 +16,12 @@ _ALIAS_GROUPS = {
 
 
 def _canonical_label(value: Any) -> str:
-    text = str(value or "").strip().lower()
-    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    raw = str(value or "").strip().lower()
+    if raw.startswith("target:"):
+        raw = raw.split(":", 1)[1]
+    text = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
+    if text.startswith("target_"):
+        text = text[len("target_") :]
     for canonical, aliases in _ALIAS_GROUPS.items():
         normalized_aliases = {
             re.sub(r"[^a-z0-9]+", "_", item).strip("_") for item in aliases
