@@ -13,11 +13,14 @@ CONTAINER="${NAVCLAW_CONTAINER:-navclaw-ep${EPISODE}-${TIMESTAMP}}"
 NAV_RUN_DIR="${ROOT}/runs/${RUN_ID}"
 MAPGPT_RUN_DIR="${MAPGPT_ROOT}/logs/${RUN_ID}"
 PORT="${NAVCLAW_PORT:-8765}"
+SELECTOR_PATH="/workspace/navclaw/bridge/frontier_only_selector.py"
+CANDIDATE_POLICY="original_frontier_only"
 
 mkdir -p "${NAV_RUN_DIR}" "${MAPGPT_RUN_DIR}"
 printf '%s\n' "${CONTAINER}" > "${NAV_RUN_DIR}/container_name.txt"
 printf '%s\n' "${RUN_ID}" > "${NAV_RUN_DIR}/run_id.txt"
 printf '%s\n' "${MAPGPT_RUN_DIR}" > "${NAV_RUN_DIR}/mapgpt_log_dir.txt"
+printf '%s\n' "${CANDIDATE_POLICY}" > "${NAV_RUN_DIR}/candidate_policy.txt"
 
 export NAVCLAW_RUN_ID="${RUN_ID}"
 export NAVCLAW_RUN_DIR="${NAV_RUN_DIR}/brain"
@@ -44,8 +47,8 @@ docker run -d \
   -e TRANSFORMERS_CACHE=/workspace/Agent-apexnav/third_party/hf_cache \
   -e APEXNAV_DATA_DIR=/workspace/Agent-apexnav/data \
   -e APEXNAV_VLM_DEBUG_DIR=/workspace/Agent-apexnav/debug \
-  -e APEXNAV_VLM_SELECTOR_SCRIPT=/workspace/navclaw/bridge/selector_client.py \
-  -e APEXNAV_VLM_FRONTIER_ONLY_CANDIDATES="${APEXNAV_VLM_FRONTIER_ONLY_CANDIDATES:-0}" \
+  -e APEXNAV_VLM_SELECTOR_SCRIPT="${SELECTOR_PATH}" \
+  -e APEXNAV_VLM_FRONTIER_ONLY_CANDIDATES=1 \
   -e NAVCLAW_SERVER_URL="http://127.0.0.1:${PORT}/decide" \
   -e NAVCLAW_SESSION_ID="${RUN_ID}:ep${EPISODE}" \
   -e NAVCLAW_BRIDGE_TIMEOUT="${NAVCLAW_BRIDGE_TIMEOUT:-900}" \
@@ -62,8 +65,8 @@ docker run -d \
     export REPO_ROOT=/workspace/Agent-apexnav
     export APEXNAV_RUN_ID='${RUN_ID}'
     export APEXNAV_BATCH_LOG_DIR='/workspace/Agent-apexnav/logs/${RUN_ID}'
-    export APEXNAV_VLM_SELECTOR_SCRIPT=/workspace/navclaw/bridge/selector_client.py
-    export APEXNAV_VLM_FRONTIER_ONLY_CANDIDATES='${APEXNAV_VLM_FRONTIER_ONLY_CANDIDATES:-0}'
+    export APEXNAV_VLM_SELECTOR_SCRIPT='${SELECTOR_PATH}'
+    export APEXNAV_VLM_FRONTIER_ONLY_CANDIDATES=1
     export NAVCLAW_SERVER_URL='http://127.0.0.1:${PORT}/decide'
     export NAVCLAW_SESSION_ID='${RUN_ID}:ep${EPISODE}'
     export NAVCLAW_BRIDGE_TIMEOUT='${NAVCLAW_BRIDGE_TIMEOUT:-900}'
@@ -90,5 +93,6 @@ docker run -d \
 docker inspect --format '{{.State.Status}} pid={{.State.Pid}}' "${CONTAINER}" \
   > "${NAV_RUN_DIR}/container_launch_state.txt"
 echo "NavClaw episode launched run_id=${RUN_ID} container=${CONTAINER}"
+echo "candidate_policy=${CANDIDATE_POLICY}"
 echo "brain_logs=${NAV_RUN_DIR}/brain"
 echo "navigation_logs=${MAPGPT_RUN_DIR}"
