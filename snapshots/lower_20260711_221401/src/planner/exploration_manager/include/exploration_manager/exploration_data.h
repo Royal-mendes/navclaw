@@ -1,0 +1,251 @@
+#ifndef _EXPL_DATA_H_
+#define _EXPL_DATA_H_
+
+#include <Eigen/Eigen>
+#include <iostream>
+#include <vector>
+#include <trajectory_manager/optimizer.h>
+
+// Undefine uint macro from optimizer.h to avoid conflict with OpenCV
+#ifdef uint
+#undef uint
+#endif
+
+namespace apexnav_planner {
+
+enum FINAL_RESULT { EXPLORE, SEARCH_OBJECT, STUCKING, NO_FRONTIER, REACH_OBJECT };
+
+struct FSMData {
+  FSMData()
+  {
+    trigger_ = false;
+    have_odom_ = false;
+    have_confidence_ = false;
+    have_finished_ = false;
+    static_state_ = true;
+    state_str_ = { "INIT", "WAIT_TRIGGER", "PLAN_ACTION", "WAIT_ACTION_FINISH", "PUB_ACTION",
+      "FINISH" };
+
+    odom_pos_ = Eigen::Vector3d::Zero();
+    odom_vel_ = Eigen::Vector3d::Zero();
+    odom_omega_ = Eigen::Vector3d::Zero();
+    odom_orient_ = Eigen::Quaterniond::Identity();
+    odom_yaw_ = 0.0;
+    start_pt_ = Eigen::Vector3d::Zero();
+    start_vel_ = Eigen::Vector3d::Zero();
+    start_yaw_ = Eigen::Vector3d::Zero();
+    last_start_pos_ = Eigen::Vector3d(-100, -100, -100);
+    last_next_pos_ = Eigen::Vector2d(-100, -100);
+    newest_action_ = -1;
+    init_action_count_ = 0;
+    stucking_action_count_ = 0;
+    stucking_next_pos_count_ = 0;
+    traveled_path_.clear();
+
+    final_result_ = -1;
+    replan_flag_ = true;
+    dormant_frontier_flag_ = false;
+    escape_stucking_flag_ = false;
+    escape_stucking_count_ = 0;
+    stucking_points_.clear();
+
+    local_pos_ = Eigen::Vector2d(0, 0);
+  }
+  // FSM data
+  bool trigger_, have_odom_, have_confidence_;
+  bool have_finished_;
+  std::vector<string> state_str_;
+  std::vector<Eigen::Vector2d> traveled_path_;
+
+  // odometry state
+  Eigen::Vector3d odom_pos_, odom_vel_, odom_omega_;
+  Eigen::Quaterniond odom_orient_;
+  double odom_yaw_;
+  bool static_state_;  // Track if robot is static or moving
+
+  Eigen::Vector3d start_pt_, start_vel_, start_yaw_;
+  Eigen::Vector3d last_start_pos_;
+  Eigen::Vector2d last_next_pos_;
+  int newest_action_;
+  int init_action_count_;
+  int stucking_action_count_;
+  int stucking_next_pos_count_;
+
+  int final_result_;
+  bool replan_flag_, dormant_frontier_flag_;
+  bool escape_stucking_flag_;
+  int escape_stucking_count_;
+  Eigen::Vector2d escape_stucking_pos_;
+  double escape_stucking_yaw_;
+  std::vector<Eigen::Vector3d> stucking_points_;
+
+  Eigen::Vector2d local_pos_;
+  LocalTrajectory newest_traj_;  // Store latest planned trajectory
+};
+
+struct FSMParam {
+  FSMParam()
+  {
+    vis_scale_ = 0.1;
+    replan_time_ = 0.2;
+    replan_traj_end_threshold_ = 1.0;
+    replan_frontier_change_delay_ = 0.5;
+    replan_timeout_ = 2.0;
+
+    const double step_length = 0.25;
+    const double angle_increment = M_PI / 6;
+    action_steps_.clear();
+    for (int i = 0; i < 12; ++i) {
+      double angle = i * angle_increment;
+      Eigen::Vector2d step(step_length * cos(angle), step_length * sin(angle));
+      action_steps_.push_back(step);
+    }
+  }
+  double vis_scale_;
+  std::vector<Eigen::Vector2d> action_steps_;
+  // replan timing parameters (loaded from ros params in ExplorationFSM::init)
+  double replan_time_;
+  double replan_traj_end_threshold_;
+  double replan_frontier_change_delay_;
+  double replan_timeout_;
+};
+
+struct ExplorationData {
+  ExplorationData()
+  {
+    frontiers_.clear();
+    frontier_averages_.clear();
+    dormant_frontiers_.clear();
+    dormant_frontier_averages_.clear();
+    objects_.clear();
+    object_averages_.clear();
+    object_labels_.clear();
+    next_pos_ = Eigen::Vector2d(0, 0);
+    next_best_path_.clear();
+    tsp_tour_.clear();
+  }
+  std::vector<std::vector<Eigen::Vector2d>> frontiers_, dormant_frontiers_;
+  std::vector<Eigen::Vector2d> frontier_averages_, dormant_frontier_averages_;
+  std::vector<std::vector<Eigen::Vector2d>> objects_;
+  std::vector<Eigen::Vector2d> object_averages_;
+  std::vector<int> object_labels_;
+  Eigen::Vector2d next_pos_;
+  Eigen::Vector2d next_local_pos_;  // Local target position along path
+  std::vector<Eigen::Vector2d> next_best_path_;
+  std::vector<Eigen::Vector2d> tsp_tour_;
+};
+
+struct ExplorationParam {
+  enum POLICY_MODE { DISTANCE, SEMANTIC, HYBRID, TSP_DIST };
+  // params
+  int policy_mode_;
+  double sigma_threshold_, max_to_mean_threshold_, max_to_mean_percentage_;
+  std::string tsp_dir_;
+  bool use_semantic_exploration_ = false;
+
+  // VLM-guided geometric exploration params. Disabled by default unless launch/config enables it.
+  bool use_vlm_guided_geometric_ = false;
+  bool vlm_waypoint_debug_ = true;
+  bool vlm_fallback_to_nearest_ = false;
+  bool vlm_require_model_decision_ = true;
+  bool vlm_disable_object_shortcut_ = true;
+  bool vlm_hold_selected_goal_ = true;
+  bool vlm_defer_target_object_proxy_search_until_reached_ = true;
+  bool vlm_fallback_to_original_geometric_after_full_scan_ = false;
+  int vlm_max_candidates_ = 8;
+  int vlm_total_max_candidates_ = 12;
+  int vlm_min_candidates_ = 2;
+  int vlm_max_scan_steps_ = 6;
+  double vlm_min_candidate_distance_ = 0.35;
+  double vlm_max_candidate_distance_ = 8.0;
+  double vlm_candidate_pixel_nms_ = 72.0;
+  double vlm_min_clearance_ = 0.10;
+  double vlm_min_candidate_clearance_m_ = 0.0;
+  double vlm_max_candidate_path_ratio_ = 3.0;
+  double vlm_recent_goal_radius_ = 0.45;
+  double vlm_scan_reject_candidate_radius_ = 0.2;
+  double vlm_goal_reached_distance_ = 0.15;
+  double vlm_target_goal_reached_distance_ = 0.20;
+  int vlm_goal_max_follow_steps_ = 40;
+  bool vlm_release_stalled_waypoint_ = true;
+  int vlm_goal_stall_grace_steps_ = 8;
+  int vlm_goal_stall_max_steps_ = 18;
+  double vlm_goal_stall_min_progress_ = 0.05;
+  bool vlm_clear_near_reached_stalled_waypoint_ = true;
+  double vlm_goal_near_reached_distance_ = 0.20;
+  int vlm_goal_near_reached_stall_steps_ = 4;
+  double vlm_look_angle_deg_ = 60.0;
+  std::string vlm_default_uncertain_turn_ = "left";
+  bool vlm_use_local_view_candidates_ = true;
+  int vlm_local_view_rays_per_sector_ = 7;
+  int vlm_local_view_max_per_sector_ = 2;
+  int vlm_local_view_pixel_window_ = 9;
+  double vlm_local_view_hfov_deg_ = 79.0;
+  double vlm_local_view_sector_front_min_deg_ = -15.0;
+  double vlm_local_view_sector_front_max_deg_ = 15.0;
+  double vlm_local_view_sector_left_front_min_deg_ = 10.0;
+  double vlm_local_view_sector_left_front_max_deg_ = 39.5;
+  double vlm_local_view_sector_right_front_min_deg_ = -39.5;
+  double vlm_local_view_sector_right_front_max_deg_ = -10.0;
+  double vlm_local_view_min_candidate_dist_ = 0.6;
+  double vlm_local_view_micro_candidate_dist_ = 0.65;
+  double vlm_local_view_preferred_candidate_dist_ = 1.1;
+  double vlm_local_view_max_candidate_dist_ = 1.6;
+  double vlm_local_view_safety_margin_ = 0.20;
+  double vlm_local_view_min_clearance_ = 0.18;
+  double vlm_local_view_max_depth_m_ = 5.0;
+  double vlm_local_view_depth_min_m_ = 0.0;
+  bool vlm_local_view_depth_is_normalized_ = true;
+  double vlm_local_view_path_ratio_max_ = 1.8;
+  double vlm_local_view_astar_max_time_ = 0.5;
+  double vlm_local_view_boundary_margin_m_ = 0.20;
+  double vlm_local_view_depth_row_min_ratio_ = 0.45;
+  double vlm_local_view_depth_row_max_ratio_ = 0.85;
+  bool vlm_recovery_candidates_enabled_ = true;
+  int vlm_recovery_max_candidates_ = 4;
+  bool vlm_compact_escape_candidates_ = true;
+  int vlm_escape_max_per_source_ = 1;
+  double vlm_recovery_min_distance_ = 0.45;
+  double vlm_recovery_max_distance_ = 2.4;
+  double vlm_recovery_min_clearance_ = 0.10;
+  double vlm_recovery_path_ratio_max_ = 3.5;
+  double vlm_camera_fx_ = 388.1910413097385;
+  double vlm_camera_fy_ = 422.0475153598262;
+  double vlm_camera_cx_ = 320.0;
+  double vlm_camera_cy_ = 240.0;
+  double vlm_camera_height_ = 0.88;
+  std::string vlm_depth_topic_ = "/habitat/camera_depth";
+  std::string vlm_debug_dir_ = "/workspace/Agent-apexnav/debug";
+  std::string vlm_selector_script_ = "/workspace/Agent-apexnav/vlm_waypoint_selector.py";
+  std::string vlm_python_executable_ = "python3";
+  bool vlm_initial_panorama_selection_enabled_ = true;
+  int vlm_initial_panorama_min_views_ = 6;
+  int vlm_initial_panorama_collect_every_n_init_turns_ = 2;
+
+  // GTTrainingCritic debug mode. Normal navigation must not consult these values.
+  std::string reflection_mode_ = "normal";
+  bool reflection_critic_only_debug_enabled_ = false;
+  std::string reflection_critic_log_dir_ = "logs/critic_debug";
+  double reflection_positive_progress_threshold_ = 0.25;
+  double reflection_negative_progress_threshold_ = -0.25;
+  double reflection_path_deviation_threshold_ = 0.8;
+  bool reflection_prefer_geodesic_distance_ = true;
+
+  // Private GT frontier-oracle rollout. This bypasses VLM only when explicitly enabled.
+  bool oracle_frontier_rollout_enabled_ = false;
+  bool oracle_frontier_label_only_enabled_ = false;
+  std::string oracle_frontier_log_dir_ = "logs/oracle_frontier_rollout";
+  double oracle_frontier_response_timeout_ = 5.0;
+  double oracle_frontier_detour_tolerance_ = 1.0;
+  double oracle_frontier_success_distance_ = 0.2;
+  double oracle_frontier_min_progress_to_select_ = 0.0;
+  double oracle_frontier_gt_path_deviation_threshold_ = 0.8;
+  double oracle_frontier_min_gt_path_progress_to_select_ = 0.05;
+  double oracle_frontier_gt_path_lookahead_m_ = 1.5;
+  bool oracle_frontier_reject_downstairs_ = true;
+  double oracle_frontier_max_downward_drop_m_ = 0.35;
+};
+
+}  // namespace apexnav_planner
+
+#endif

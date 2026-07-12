@@ -1,0 +1,7323 @@
+/**
+ * @file exploration_manager.cpp
+ * @brief Implementation of exploration manager for autonomous semantic navigation
+ * @author Zager-Zhang
+ *
+ * This file implements the ExplorationManager class that handles various
+ * exploration strategies including distance-based, semantic-based, hybrid,
+ * and TSP-optimized frontier selection for autonomous robot exploration.
+ */
+
+#include <exploration_manager/exploration_manager.h>
+#include <exploration_manager/exploration_data.h>
+#include <lkh_mtsp_solver/SolveMTSP.h>
+#include <path_searching/kino_astar.h>
+#include <plan_env/map_ros.h>
+#include <trajectory_manager/optimizer.h>
+
+#include <cv_bridge/cv_bridge.h>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
+#include <sensor_msgs/image_encodings.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <iomanip>
+#include <limits>
+#include <sstream>
+#include <stdexcept>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+using namespace Eigen;
+
+namespace apexnav_planner {
+namespace {
+double g_vlm_candidate_merge_distance = 0.55;
+constexpr int kActionTurnLeft = 2;
+constexpr int kActionTurnRight = 3;
+
+std::string envOrDefault(const char* name, const std::string& fallback) {
+  const char* value = std::getenv(name);
+  return (value && value[0] != '\0') ? std::string(value) : fallback;
+}
+
+bool envFlag(const char* name, bool& out) {
+  const char* value = std::getenv(name);
+  if (!value || value[0] == '\0')
+    return false;
+  std::string text(value);
+  std::transform(text.begin(), text.end(), text.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (text == "1" || text == "true" || text == "yes" || text == "on") {
+    out = true;
+    return true;
+  }
+  if (text == "0" || text == "false" || text == "no" || text == "off") {
+    out = false;
+    return true;
+  }
+  return false;
+}
+
+bool envDouble(const char* name, double& out) {
+  const char* value = std::getenv(name);
+  if (!value || value[0] == '\0')
+    return false;
+  char* end = nullptr;
+  const double parsed = std::strtod(value, &end);
+  if (end == value || !std::isfinite(parsed))
+    return false;
+  out = parsed;
+  return true;
+}
+
+bool envInt(const char* name, int& out) {
+  const char* value = std::getenv(name);
+  if (!value || value[0] == '\0')
+    return false;
+  char* end = nullptr;
+  const long parsed = std::strtol(value, &end, 10);
+  if (end == value)
+    return false;
+  out = static_cast<int>(parsed);
+  return true;
+}
+
+constexpr double kDiscreteTurnAngleDeg = 30.0;
+}
+
+ExplorationManager::~ExplorationManager() = default;
+
+void ExplorationManager::initialize(ros::NodeHandle& nh)
+{
+  // Initialize SDF map and get object map reference
+  sdf_map_.reset(new SDFMap2D);
+  sdf_map_->initMap(nh);
+  object_map2d_ = sdf_map_->object_map2d_;
+
+  // Initialize frontier map and path finder
+  frontier_map2d_.reset(new FrontierMap2D(sdf_map_, nh));
+  path_finder_.reset(new Astar2D);
+  path_finder_->init(nh, sdf_map_);
+
+  // Initialize exploration data and parameter containers
+  ed_.reset(new ExplorationData);
+  ep_.reset(new ExplorationParam);
+
+  // Load exploration parameters from ROS parameter server
+  nh.param("exploration/policy", ep_->policy_mode_, 0);
+  nh.param("exploration/sigma_threshold", ep_->sigma_threshold_, 0.030);
+  nh.param("exploration/max_to_mean_threshold", ep_->max_to_mean_threshold_, 1.2);
+  nh.param("exploration/max_to_mean_percentage", ep_->max_to_mean_percentage_, 0.95);
+  nh.param("exploration/tsp_dir", ep_->tsp_dir_, string("null"));
+  nh.param("exploration/use_semantic_exploration", ep_->use_semantic_exploration_, false);
+  nh.param("exploration/use_vlm_guided_geometric", ep_->use_vlm_guided_geometric_, false);
+  nh.param("exploration/vlm_waypoint_debug", ep_->vlm_waypoint_debug_, true);
+  nh.param("exploration/vlm_max_candidates", ep_->vlm_max_candidates_, 8);
+  nh.param("exploration/vlm_total_max_candidates", ep_->vlm_total_max_candidates_, 12);
+  nh.param("exploration/vlm_min_candidates", ep_->vlm_min_candidates_, 2);
+  nh.param("exploration/vlm_fallback_to_nearest", ep_->vlm_fallback_to_nearest_, false);
+  nh.param("exploration/vlm_require_model_decision", ep_->vlm_require_model_decision_, true);
+  nh.param("exploration/vlm_disable_object_shortcut", ep_->vlm_disable_object_shortcut_, true);
+  nh.param("exploration/vlm_hold_selected_goal", ep_->vlm_hold_selected_goal_, true);
+  nh.param("exploration/vlm_defer_target_object_proxy_search_until_reached",
+      ep_->vlm_defer_target_object_proxy_search_until_reached_, true);
+  nh.param("exploration/vlm_look_angle_deg", ep_->vlm_look_angle_deg_, 60.0);
+  nh.param("exploration/vlm_max_scan_steps", ep_->vlm_max_scan_steps_, 6);
+  nh.param("exploration/vlm_default_uncertain_turn", ep_->vlm_default_uncertain_turn_,
+      string("left"));
+  nh.param("exploration/vlm_use_local_view_candidates", ep_->vlm_use_local_view_candidates_, true);
+  nh.param("exploration/vlm_local_view_rays_per_sector", ep_->vlm_local_view_rays_per_sector_, 7);
+  nh.param("exploration/vlm_local_view_max_per_sector", ep_->vlm_local_view_max_per_sector_, 2);
+  nh.param("exploration/vlm_local_view_pixel_window", ep_->vlm_local_view_pixel_window_, 9);
+  nh.param("exploration/vlm_local_view_hfov_deg", ep_->vlm_local_view_hfov_deg_, 79.0);
+  nh.param("exploration/vlm_local_view_sector_front_min_deg", ep_->vlm_local_view_sector_front_min_deg_, -15.0);
+  nh.param("exploration/vlm_local_view_sector_front_max_deg", ep_->vlm_local_view_sector_front_max_deg_, 15.0);
+  nh.param("exploration/vlm_local_view_sector_left_front_min_deg", ep_->vlm_local_view_sector_left_front_min_deg_, 10.0);
+  nh.param("exploration/vlm_local_view_sector_left_front_max_deg", ep_->vlm_local_view_sector_left_front_max_deg_, 39.5);
+  nh.param("exploration/vlm_local_view_sector_right_front_min_deg", ep_->vlm_local_view_sector_right_front_min_deg_, -39.5);
+  nh.param("exploration/vlm_local_view_sector_right_front_max_deg", ep_->vlm_local_view_sector_right_front_max_deg_, -10.0);
+  nh.param("exploration/vlm_local_view_min_candidate_dist", ep_->vlm_local_view_min_candidate_dist_, 0.6);
+  nh.param("exploration/vlm_local_view_micro_candidate_dist", ep_->vlm_local_view_micro_candidate_dist_, 0.65);
+  nh.param("exploration/vlm_local_view_preferred_candidate_dist", ep_->vlm_local_view_preferred_candidate_dist_, 1.1);
+  nh.param("exploration/vlm_local_view_max_candidate_dist", ep_->vlm_local_view_max_candidate_dist_, 1.6);
+  nh.param("exploration/vlm_local_view_safety_margin", ep_->vlm_local_view_safety_margin_, 0.20);
+  nh.param("exploration/vlm_local_view_min_clearance", ep_->vlm_local_view_min_clearance_, 0.18);
+  nh.param("exploration/vlm_local_view_max_depth_m", ep_->vlm_local_view_max_depth_m_, 5.0);
+  nh.param("exploration/vlm_local_view_depth_min_m", ep_->vlm_local_view_depth_min_m_, 0.0);
+  nh.param("exploration/vlm_local_view_depth_is_normalized", ep_->vlm_local_view_depth_is_normalized_, true);
+  nh.param("exploration/vlm_local_view_path_ratio_max", ep_->vlm_local_view_path_ratio_max_, 1.8);
+  nh.param("exploration/vlm_local_view_astar_max_time", ep_->vlm_local_view_astar_max_time_, 0.5);
+  nh.param("exploration/vlm_local_view_boundary_margin_m", ep_->vlm_local_view_boundary_margin_m_, 0.20);
+  nh.param("exploration/vlm_local_view_depth_row_min_ratio", ep_->vlm_local_view_depth_row_min_ratio_, 0.45);
+  nh.param("exploration/vlm_local_view_depth_row_max_ratio", ep_->vlm_local_view_depth_row_max_ratio_, 0.85);
+  nh.param("exploration/vlm_recovery_candidates_enabled", ep_->vlm_recovery_candidates_enabled_, true);
+  nh.param("exploration/vlm_recovery_max_candidates", ep_->vlm_recovery_max_candidates_, 4);
+  nh.param("exploration/vlm_compact_escape_candidates", ep_->vlm_compact_escape_candidates_, true);
+  nh.param("exploration/vlm_escape_max_per_source", ep_->vlm_escape_max_per_source_, 1);
+  nh.param("exploration/vlm_recovery_min_distance", ep_->vlm_recovery_min_distance_, 0.45);
+  nh.param("exploration/vlm_recovery_max_distance", ep_->vlm_recovery_max_distance_, 2.4);
+  nh.param("exploration/vlm_recovery_min_clearance", ep_->vlm_recovery_min_clearance_, 0.10);
+  nh.param("exploration/vlm_recovery_path_ratio_max", ep_->vlm_recovery_path_ratio_max_, 3.5);
+  nh.param("/habitat/simulator/agents/main_agent/sim_sensors/depth_sensor/max_depth",
+      ep_->vlm_local_view_max_depth_m_, ep_->vlm_local_view_max_depth_m_);
+  nh.param("/habitat/simulator/agents/main_agent/sim_sensors/depth_sensor/min_depth",
+      ep_->vlm_local_view_depth_min_m_, ep_->vlm_local_view_depth_min_m_);
+  nh.param("/habitat/simulator/agents/main_agent/sim_sensors/depth_sensor/normalize_depth",
+      ep_->vlm_local_view_depth_is_normalized_, ep_->vlm_local_view_depth_is_normalized_);
+  nh.param("exploration/vlm_fallback_to_original_geometric_after_full_scan",
+      ep_->vlm_fallback_to_original_geometric_after_full_scan_, false);
+  nh.param("exploration/vlm_min_candidate_distance", ep_->vlm_min_candidate_distance_, 0.35);
+  nh.param("exploration/vlm_max_candidate_distance", ep_->vlm_max_candidate_distance_, 8.0);
+  nh.param("exploration/vlm_candidate_merge_distance", g_vlm_candidate_merge_distance, 0.55);
+  nh.param("exploration/vlm_candidate_pixel_nms", ep_->vlm_candidate_pixel_nms_, 72.0);
+  nh.param("exploration/vlm_min_clearance", ep_->vlm_min_clearance_, 0.10);
+  nh.param("exploration/vlm_min_candidate_clearance_m", ep_->vlm_min_candidate_clearance_m_, 0.0);
+  nh.param("exploration/vlm_max_candidate_path_ratio", ep_->vlm_max_candidate_path_ratio_, 3.0);
+  nh.param("exploration/vlm_recent_goal_radius", ep_->vlm_recent_goal_radius_, 0.45);
+  nh.param("exploration/vlm_scan_reject_candidate_radius",
+      ep_->vlm_scan_reject_candidate_radius_, 0.0);
+  nh.param("exploration/vlm_goal_reached_distance", ep_->vlm_goal_reached_distance_, 0.15);
+  nh.param("exploration/vlm_target_goal_reached_distance",
+      ep_->vlm_target_goal_reached_distance_, 0.20);
+  nh.param("exploration/vlm_goal_max_follow_steps", ep_->vlm_goal_max_follow_steps_, 40);
+  nh.param("exploration/vlm_release_stalled_waypoint",
+      ep_->vlm_release_stalled_waypoint_, true);
+  nh.param("exploration/vlm_goal_stall_grace_steps",
+      ep_->vlm_goal_stall_grace_steps_, 8);
+  nh.param("exploration/vlm_goal_stall_max_steps",
+      ep_->vlm_goal_stall_max_steps_, 18);
+  nh.param("exploration/vlm_goal_stall_min_progress",
+      ep_->vlm_goal_stall_min_progress_, 0.05);
+  nh.param("exploration/vlm_clear_near_reached_stalled_waypoint",
+      ep_->vlm_clear_near_reached_stalled_waypoint_, true);
+  nh.param("exploration/vlm_goal_near_reached_distance",
+      ep_->vlm_goal_near_reached_distance_, 0.20);
+  nh.param("exploration/vlm_goal_near_reached_stall_steps",
+      ep_->vlm_goal_near_reached_stall_steps_, 4);
+  nh.param("map_ros/fx", ep_->vlm_camera_fx_, 388.1910413097385);
+  nh.param("map_ros/fy", ep_->vlm_camera_fy_, 422.0475153598262);
+  nh.param("map_ros/cx", ep_->vlm_camera_cx_, 320.0);
+  nh.param("map_ros/cy", ep_->vlm_camera_cy_, 240.0);
+  nh.param("exploration/vlm_camera_height", ep_->vlm_camera_height_, 0.88);
+  std::string vlm_rgb_topic;
+  nh.param("exploration/vlm_rgb_topic", vlm_rgb_topic, string("/habitat/camera_rgb_raw"));
+  nh.param("exploration/vlm_depth_topic", ep_->vlm_depth_topic_, string("/habitat/camera_depth"));
+  nh.param("exploration/vlm_debug_dir", ep_->vlm_debug_dir_,
+      envOrDefault("APEXNAV_VLM_DEBUG_DIR", "/workspace/Agent-apexnav/debug"));
+  nh.param("exploration/vlm_selector_script", ep_->vlm_selector_script_,
+      envOrDefault("APEXNAV_VLM_SELECTOR_SCRIPT",
+          "/workspace/Agent-apexnav/vlm_waypoint_selector.py"));
+  nh.param("exploration/vlm_python_executable", ep_->vlm_python_executable_, string("python3"));
+  nh.param("exploration/vlm_initial_panorama_selection_enabled",
+      ep_->vlm_initial_panorama_selection_enabled_, true);
+  nh.param("exploration/vlm_initial_panorama_min_views",
+      ep_->vlm_initial_panorama_min_views_, 6);
+  nh.param("exploration/vlm_initial_panorama_collect_every_n_init_turns",
+      ep_->vlm_initial_panorama_collect_every_n_init_turns_, 2);
+  nh.param("reflection/mode", ep_->reflection_mode_, string("normal"));
+  nh.param("reflection/critic_only_debug/enabled",
+      ep_->reflection_critic_only_debug_enabled_, false);
+  nh.param("reflection/critic_only_debug/log_dir", ep_->reflection_critic_log_dir_,
+      string("logs/critic_debug"));
+  nh.param("reflection/critic_only_debug/positive_progress_threshold",
+      ep_->reflection_positive_progress_threshold_, 0.25);
+  nh.param("reflection/critic_only_debug/negative_progress_threshold",
+      ep_->reflection_negative_progress_threshold_, -0.25);
+  nh.param("reflection/critic_only_debug/path_deviation_threshold",
+      ep_->reflection_path_deviation_threshold_, 0.8);
+  nh.param("reflection/critic_only_debug/prefer_geodesic_distance",
+      ep_->reflection_prefer_geodesic_distance_, true);
+  nh.param("oracle_frontier_rollout/enabled", ep_->oracle_frontier_rollout_enabled_, false);
+  nh.param("oracle_frontier_rollout/label_only_enabled",
+      ep_->oracle_frontier_label_only_enabled_, false);
+  nh.param("oracle_frontier_rollout/log_dir", ep_->oracle_frontier_log_dir_,
+      string("logs/oracle_frontier_rollout"));
+  nh.param("oracle_frontier_rollout/response_timeout",
+      ep_->oracle_frontier_response_timeout_, 5.0);
+  nh.param("oracle_frontier_rollout/detour_tolerance",
+      ep_->oracle_frontier_detour_tolerance_, 1.0);
+  nh.param("oracle_frontier_rollout/success_distance",
+      ep_->oracle_frontier_success_distance_, 0.2);
+  nh.param("oracle_frontier_rollout/min_progress_to_select",
+      ep_->oracle_frontier_min_progress_to_select_, 0.0);
+  nh.param("oracle_frontier_rollout/gt_path_deviation_threshold",
+      ep_->oracle_frontier_gt_path_deviation_threshold_, 0.8);
+  nh.param("oracle_frontier_rollout/min_gt_path_progress_to_select",
+      ep_->oracle_frontier_min_gt_path_progress_to_select_, 0.05);
+  nh.param("oracle_frontier_rollout/gt_path_lookahead_m",
+      ep_->oracle_frontier_gt_path_lookahead_m_, 1.5);
+  nh.param("oracle_frontier_rollout/reject_downstairs",
+      ep_->oracle_frontier_reject_downstairs_, true);
+  nh.param("oracle_frontier_rollout/max_downward_drop_m",
+      ep_->oracle_frontier_max_downward_drop_m_, 0.35);
+  bool env_bool = false;
+  if (envFlag("APEXNAV_ORACLE_FRONTIER_ENABLED", env_bool))
+    ep_->oracle_frontier_rollout_enabled_ = env_bool;
+  if (envFlag("APEXNAV_ORACLE_FRONTIER_LABEL_ONLY", env_bool))
+    ep_->oracle_frontier_label_only_enabled_ = env_bool;
+  if (envFlag("APEXNAV_ORACLE_FRONTIER_REJECT_DOWNSTAIRS", env_bool))
+    ep_->oracle_frontier_reject_downstairs_ = env_bool;
+  if (envFlag("APEXNAV_VLM_REQUIRE_MODEL_DECISION", env_bool))
+    ep_->vlm_require_model_decision_ = env_bool;
+  if (envFlag("APEXNAV_VLM_REQUIRE_SUCCESS", env_bool))
+    ep_->vlm_require_model_decision_ = env_bool;
+  if (envFlag("APEXNAV_VLM_DISABLE_OBJECT_SHORTCUT", env_bool))
+    ep_->vlm_disable_object_shortcut_ = env_bool;
+  if (envFlag("APEXNAV_VLM_DEFER_TARGET_OBJECT_PROXY_SEARCH_UNTIL_REACHED", env_bool))
+    ep_->vlm_defer_target_object_proxy_search_until_reached_ = env_bool;
+  if (envFlag("APEXNAV_VLM_RELEASE_STALLED_WAYPOINT", env_bool))
+    ep_->vlm_release_stalled_waypoint_ = env_bool;
+  if (envFlag("APEXNAV_VLM_CLEAR_NEAR_REACHED_STALLED_WAYPOINT", env_bool))
+    ep_->vlm_clear_near_reached_stalled_waypoint_ = env_bool;
+  envDouble("APEXNAV_VLM_GOAL_REACHED_DISTANCE", ep_->vlm_goal_reached_distance_);
+  envDouble("APEXNAV_VLM_TARGET_GOAL_REACHED_DISTANCE",
+      ep_->vlm_target_goal_reached_distance_);
+  envInt("APEXNAV_VLM_GOAL_MAX_FOLLOW_STEPS", ep_->vlm_goal_max_follow_steps_);
+  envInt("APEXNAV_VLM_GOAL_STALL_GRACE_STEPS", ep_->vlm_goal_stall_grace_steps_);
+  envInt("APEXNAV_VLM_GOAL_STALL_MAX_STEPS", ep_->vlm_goal_stall_max_steps_);
+  envDouble("APEXNAV_VLM_GOAL_STALL_MIN_PROGRESS", ep_->vlm_goal_stall_min_progress_);
+  envDouble("APEXNAV_VLM_GOAL_NEAR_REACHED_DISTANCE", ep_->vlm_goal_near_reached_distance_);
+  envInt("APEXNAV_VLM_GOAL_NEAR_REACHED_STALL_STEPS",
+      ep_->vlm_goal_near_reached_stall_steps_);
+  ep_->vlm_require_model_decision_ = true;
+  const string oracle_frontier_log_dir_env =
+      envOrDefault("APEXNAV_ORACLE_FRONTIER_LOG_DIR", "");
+  if (!oracle_frontier_log_dir_env.empty())
+    ep_->oracle_frontier_log_dir_ = oracle_frontier_log_dir_env;
+  else {
+    const string oracle_rollout_log_dir_env =
+        envOrDefault("APEXNAV_ORACLE_ROLLOUT_LOG_DIR", "");
+    if (!oracle_rollout_log_dir_env.empty())
+      ep_->oracle_frontier_log_dir_ = oracle_rollout_log_dir_env;
+  }
+  envDouble("APEXNAV_ORACLE_FRONTIER_MAX_DOWNWARD_DROP_M",
+      ep_->oracle_frontier_max_downward_drop_m_);
+
+  ep_->vlm_max_candidates_ = std::max(1, ep_->vlm_max_candidates_);
+  ep_->vlm_min_candidates_ = std::max(1, ep_->vlm_min_candidates_);
+  ep_->vlm_min_candidates_ = std::min(ep_->vlm_min_candidates_, ep_->vlm_max_candidates_);
+  ep_->vlm_total_max_candidates_ = std::max(ep_->vlm_min_candidates_, ep_->vlm_total_max_candidates_);
+  ep_->vlm_recovery_max_candidates_ = std::max(1, ep_->vlm_recovery_max_candidates_);
+  ep_->vlm_escape_max_per_source_ = std::max(1, ep_->vlm_escape_max_per_source_);
+  ep_->vlm_recovery_min_distance_ = std::max(0.20, ep_->vlm_recovery_min_distance_);
+  ep_->vlm_recovery_max_distance_ =
+      std::max(ep_->vlm_recovery_min_distance_, ep_->vlm_recovery_max_distance_);
+  ep_->vlm_recovery_min_clearance_ = std::max(0.0, ep_->vlm_recovery_min_clearance_);
+  ep_->vlm_recovery_path_ratio_max_ = std::max(1.1, ep_->vlm_recovery_path_ratio_max_);
+  ep_->vlm_goal_reached_distance_ = std::max(0.05, ep_->vlm_goal_reached_distance_);
+  ep_->vlm_target_goal_reached_distance_ =
+      std::max(ep_->vlm_goal_reached_distance_, ep_->vlm_target_goal_reached_distance_);
+  ep_->vlm_goal_max_follow_steps_ = std::max(1, ep_->vlm_goal_max_follow_steps_);
+  ep_->vlm_goal_stall_grace_steps_ = std::max(0, ep_->vlm_goal_stall_grace_steps_);
+  ep_->vlm_goal_stall_max_steps_ = std::max(1, ep_->vlm_goal_stall_max_steps_);
+  ep_->vlm_goal_stall_min_progress_ =
+      std::max(0.0, ep_->vlm_goal_stall_min_progress_);
+  ep_->vlm_goal_near_reached_distance_ =
+      std::max(ep_->vlm_goal_reached_distance_, ep_->vlm_goal_near_reached_distance_);
+  ep_->vlm_goal_near_reached_stall_steps_ =
+      std::max(1, ep_->vlm_goal_near_reached_stall_steps_);
+  ep_->vlm_look_angle_deg_ = std::max(1.0, ep_->vlm_look_angle_deg_);
+  ep_->vlm_max_scan_steps_ = std::max(1, ep_->vlm_max_scan_steps_);
+  std::transform(ep_->vlm_default_uncertain_turn_.begin(), ep_->vlm_default_uncertain_turn_.end(),
+      ep_->vlm_default_uncertain_turn_.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  if (ep_->vlm_default_uncertain_turn_ != "left" && ep_->vlm_default_uncertain_turn_ != "right")
+    ep_->vlm_default_uncertain_turn_ = "left";
+  g_vlm_candidate_merge_distance = std::max(0.0, g_vlm_candidate_merge_distance);
+  ep_->vlm_candidate_pixel_nms_ = std::max(0.0, ep_->vlm_candidate_pixel_nms_);
+  ep_->vlm_min_clearance_ = std::max(0.0, ep_->vlm_min_clearance_);
+  ep_->vlm_min_candidate_clearance_m_ =
+      std::max(0.0, ep_->vlm_min_candidate_clearance_m_);
+  ep_->vlm_max_candidate_path_ratio_ =
+      std::max(1.0, ep_->vlm_max_candidate_path_ratio_);
+  ep_->vlm_scan_reject_candidate_radius_ =
+      std::max(0.0, ep_->vlm_scan_reject_candidate_radius_);
+  ep_->vlm_local_view_rays_per_sector_ = std::max(1, ep_->vlm_local_view_rays_per_sector_);
+  ep_->vlm_local_view_max_per_sector_ = std::max(1, ep_->vlm_local_view_max_per_sector_);
+  ep_->vlm_local_view_pixel_window_ = std::max(1, ep_->vlm_local_view_pixel_window_);
+  ep_->vlm_local_view_hfov_deg_ = std::max(1.0, ep_->vlm_local_view_hfov_deg_);
+  ep_->vlm_local_view_min_candidate_dist_ = std::max(0.05, ep_->vlm_local_view_min_candidate_dist_);
+  ep_->vlm_local_view_max_candidate_dist_ =
+      std::max(ep_->vlm_local_view_min_candidate_dist_, ep_->vlm_local_view_max_candidate_dist_);
+  ep_->vlm_local_view_micro_candidate_dist_ = std::min(
+      ep_->vlm_local_view_max_candidate_dist_,
+      std::max(ep_->vlm_local_view_min_candidate_dist_, ep_->vlm_local_view_micro_candidate_dist_));
+  ep_->vlm_local_view_preferred_candidate_dist_ = std::min(
+      ep_->vlm_local_view_max_candidate_dist_,
+      std::max(ep_->vlm_local_view_min_candidate_dist_, ep_->vlm_local_view_preferred_candidate_dist_));
+  ep_->vlm_local_view_safety_margin_ = std::max(0.0, ep_->vlm_local_view_safety_margin_);
+  ep_->vlm_local_view_min_clearance_ = std::max(0.0, ep_->vlm_local_view_min_clearance_);
+  ep_->vlm_local_view_max_depth_m_ = std::max(0.1, ep_->vlm_local_view_max_depth_m_);
+  ep_->vlm_local_view_depth_min_m_ = std::max(0.0, ep_->vlm_local_view_depth_min_m_);
+  ep_->vlm_local_view_path_ratio_max_ = std::max(1.0, ep_->vlm_local_view_path_ratio_max_);
+  ep_->vlm_local_view_astar_max_time_ = std::max(0.05, ep_->vlm_local_view_astar_max_time_);
+  ep_->vlm_local_view_boundary_margin_m_ = std::max(0.0, ep_->vlm_local_view_boundary_margin_m_);
+  ep_->vlm_local_view_depth_row_min_ratio_ =
+      std::min(0.95, std::max(0.0, ep_->vlm_local_view_depth_row_min_ratio_));
+  ep_->vlm_local_view_depth_row_max_ratio_ =
+      std::min(1.0, std::max(ep_->vlm_local_view_depth_row_min_ratio_ + 0.01,
+                         ep_->vlm_local_view_depth_row_max_ratio_));
+  ep_->vlm_initial_panorama_min_views_ =
+      std::max(1, ep_->vlm_initial_panorama_min_views_);
+  ep_->vlm_initial_panorama_collect_every_n_init_turns_ =
+      std::max(1, ep_->vlm_initial_panorama_collect_every_n_init_turns_);
+  ep_->reflection_positive_progress_threshold_ =
+      std::max(0.0, ep_->reflection_positive_progress_threshold_);
+  ep_->reflection_negative_progress_threshold_ =
+      std::min(0.0, ep_->reflection_negative_progress_threshold_);
+  ep_->reflection_path_deviation_threshold_ =
+      std::max(0.0, ep_->reflection_path_deviation_threshold_);
+  ep_->oracle_frontier_response_timeout_ =
+      std::max(0.1, ep_->oracle_frontier_response_timeout_);
+  ep_->oracle_frontier_detour_tolerance_ =
+      std::max(0.0, ep_->oracle_frontier_detour_tolerance_);
+  ep_->oracle_frontier_success_distance_ =
+      std::max(0.01, ep_->oracle_frontier_success_distance_);
+  ep_->oracle_frontier_min_progress_to_select_ =
+      std::max(-10.0, ep_->oracle_frontier_min_progress_to_select_);
+  ep_->oracle_frontier_gt_path_deviation_threshold_ =
+      std::max(0.0, ep_->oracle_frontier_gt_path_deviation_threshold_);
+  ep_->oracle_frontier_min_gt_path_progress_to_select_ =
+      std::max(0.0, ep_->oracle_frontier_min_gt_path_progress_to_select_);
+  ep_->oracle_frontier_gt_path_lookahead_m_ =
+      std::max(0.1, ep_->oracle_frontier_gt_path_lookahead_m_);
+  ep_->oracle_frontier_max_downward_drop_m_ =
+      std::max(0.0, ep_->oracle_frontier_max_downward_drop_m_);
+  if (ep_->reflection_mode_ != "normal" && ep_->reflection_mode_ != "critic_only_debug") {
+    ROS_WARN("[GTTrainingCritic] Unknown reflection/mode=%s; forcing normal",
+        ep_->reflection_mode_.c_str());
+    ep_->reflection_mode_ = "normal";
+  }
+
+  // Subscribe to optional context used only by VLM-guided geometric exploration.
+  rgb_sub_ = nh.subscribe(vlm_rgb_topic, 1, &ExplorationManager::rgbCallback, this);
+  depth_sub_ = nh.subscribe(ep_->vlm_depth_topic_, 1, &ExplorationManager::depthCallback, this);
+  target_label_sub_ =
+      nh.subscribe("/detector/label", 1, &ExplorationManager::targetLabelCallback, this);
+  progress_sub_ = nh.subscribe("/habitat/progress", 1, &ExplorationManager::progressCallback, this);
+  critic_gt_sub_ =
+      nh.subscribe("/habitat/critic_gt", 10, &ExplorationManager::criticGTCallback, this);
+  habitat_state_sub_ =
+      nh.subscribe("/habitat/state", 10, &ExplorationManager::habitatStateCallback, this);
+
+  ROS_WARN("[GTTrainingCritic] mode=%s enabled=%s log_dir=%s prefer_geodesic=%s",
+      ep_->reflection_mode_.c_str(), isCriticOnlyDebugMode() ? "true" : "false",
+      ep_->reflection_critic_log_dir_.c_str(),
+      ep_->reflection_prefer_geodesic_distance_ ? "true" : "false");
+  ROS_WARN("[FrontierOracle] enabled=%s log_dir=%s timeout=%.1f detour_tolerance=%.2f min_progress=%.2f gt_path_dev=%.2f gt_path_min_progress=%.2f lookahead=%.2f reject_downstairs=%s max_downward_drop=%.2f",
+      isOracleFrontierRolloutMode() ? "true" : "false",
+      ep_->oracle_frontier_log_dir_.c_str(), ep_->oracle_frontier_response_timeout_,
+      ep_->oracle_frontier_detour_tolerance_, ep_->oracle_frontier_min_progress_to_select_,
+      ep_->oracle_frontier_gt_path_deviation_threshold_,
+      ep_->oracle_frontier_min_gt_path_progress_to_select_,
+      ep_->oracle_frontier_gt_path_lookahead_m_,
+      ep_->oracle_frontier_reject_downstairs_ ? "true" : "false",
+      ep_->oracle_frontier_max_downward_drop_m_);
+  ROS_WARN("[VLM Initial Panorama] enabled=%s min_views=%d collect_every=%d",
+      ep_->vlm_initial_panorama_selection_enabled_ ? "true" : "false",
+      ep_->vlm_initial_panorama_min_views_,
+      ep_->vlm_initial_panorama_collect_every_n_init_turns_);
+  ROS_WARN("[VLM Strict] require_model_decision=%s (APEXNAV_VLM_REQUIRE_MODEL_DECISION/APEXNAV_VLM_REQUIRE_SUCCESS)",
+      ep_->vlm_require_model_decision_ ? "true" : "false");
+  ROS_WARN("[VLM Strict] disable_object_shortcut=%s (APEXNAV_VLM_DISABLE_OBJECT_SHORTCUT)",
+      ep_->vlm_disable_object_shortcut_ ? "true" : "false");
+  ROS_WARN("[VLM Target] defer_target_object_proxy_search_until_reached=%s "
+           "(APEXNAV_VLM_DEFER_TARGET_OBJECT_PROXY_SEARCH_UNTIL_REACHED)",
+      ep_->vlm_defer_target_object_proxy_search_until_reached_ ? "true" : "false");
+
+  // Get map parameters for ray casting initialization
+  double resolution = sdf_map_->getResolution();
+  Eigen::Vector2d origin, size;
+  sdf_map_->getRegion(origin, size);
+
+  // Initialize ray caster for collision checking and TSP service client
+  ray_caster2d_.reset(new RayCaster2D);
+  ray_caster2d_->setParams(resolution, origin);
+  tsp_client_ = nh.serviceClient<lkh_mtsp_solver::SolveMTSP>("/solve_tsp", true);
+
+  // Initialize KinoAstar and GCopter for real-world trajectory planning
+  kinoastar_.reset(new KinoAstar(nh, sdf_map_));
+  kinoastar_->init();
+  
+  Config gcopter_config(nh);
+  gcopter_.reset(new Gcopter(gcopter_config, nh, sdf_map_, kinoastar_));
+  
+  ROS_INFO("[ExplorationManager] KinoAstar and GCopter initialized for real-world mode");
+}
+
+int ExplorationManager::planNextBestPoint(const Vector3d& pos, const double& yaw)
+{
+  Vector2d pos2d = Vector2d(pos(0), pos(1));
+  vlm_selected_target_object_proxy_in_last_plan_ = false;
+  vlm_reached_target_object_proxy_stop_in_last_plan_ = false;
+  critic_last_planning_pos_ = pos2d;
+  maybeFinalizePendingCriticDecision(pos2d, "scan_action_completed");
+  ros::Time t1 = ros::Time::now();
+  auto t2 = t1;
+
+  // Clear previous planning results
+  ed_->tsp_tour_.clear();
+  ed_->next_best_path_.clear();
+  vector<pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>> object_clouds;
+  sdf_map_->object_map2d_->getTopConfidenceObjectCloud(object_clouds);
+  const bool object_shortcut_enabled =
+      !(ep_->use_vlm_guided_geometric_ && ep_->vlm_disable_object_shortcut_);
+
+  // ==================== Navigation Mode: High-Confidence Objects ====================
+  if (object_shortcut_enabled && !object_clouds.empty()) {
+    ROS_WARN("[Navigation Mode] Get object_cloud num = %ld", object_clouds.size());
+
+    // Try to find path to each detected object in order of confidence
+    for (auto object_cloud : object_clouds) {
+      if (searchObjectPath(pos, object_cloud, ed_->next_pos_, ed_->next_best_path_)) {
+        clearActiveVLMWaypoint("high_confidence_object");
+        return SEARCH_BEST_OBJECT;
+      }
+    }
+  }
+
+  // ==================== Navigation Mode: Over-Depth Objects ====================
+  if (object_shortcut_enabled && !object_map2d_->over_depth_object_cloud_->points.empty()) {
+    ROS_WARN("[Navigation Mode (Over Depth)] Get over depth object cloud");
+    if (searchObjectPath(
+            pos, object_map2d_->over_depth_object_cloud_, ed_->next_pos_, ed_->next_best_path_)) {
+      clearActiveVLMWaypoint("over_depth_object");
+      return SEARCH_OVER_DEPTH_OBJECT;
+    }
+  }
+
+  // ==================== Exploration Mode: Frontier-Based Planning ====================
+  sdf_map_->object_map2d_->getTopConfidenceObjectCloud(object_clouds, false);
+  pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> top_object_cloud(
+      new pcl::PointCloud<pcl::PointXYZ>);
+  if (object_clouds.size() >= 1)
+    top_object_cloud = object_clouds[0];
+
+  // Apply selected exploration policy to choose next frontier
+  Eigen::Vector2d next_best_pos;
+  std::vector<Eigen::Vector2d> next_best_path;
+  chooseExplorationPolicy(pos2d, yaw, ed_->frontier_averages_, next_best_pos, next_best_path);
+
+  // HYBRID policy can reach an already active VLM target proxy in its semantic-peak
+  // branch without entering findVLMGuidedFrontierPolicy(). Consume the same model-
+  // authorized stop handshake centrally before any path is executed. The early
+  // consumption in findVLMGuidedFrontierPolicy() remains necessary to avoid issuing
+  // another LLM request after the target proxy has already been reached.
+  if (!vlm_reached_target_object_proxy_stop_in_last_plan_ &&
+      consumeReachedVLMTargetObjectProxyStop()) {
+    vlm_reached_target_object_proxy_stop_in_last_plan_ = true;
+    ROS_WARN("[VLM Target] Central policy fallback consumed the reached target proxy stop latch "
+             "before any path execution.");
+  }
+
+  if (vlm_reached_target_object_proxy_stop_in_last_plan_) {
+    ed_->next_pos_ = pos2d;
+    ed_->next_best_path_.clear();
+    ROS_WARN("[VLM Target] Return REACH_VLM_TARGET_OBJECT in the same planning cycle "
+             "that consumed the reached target proxy stop latch.");
+    return REACH_VLM_TARGET_OBJECT;
+  }
+
+  if (isOracleFrontierRolloutMode() && oracle_frontier_blocked_downstairs_) {
+    ed_->next_pos_ = pos2d;
+    ed_->next_best_path_.clear();
+    clearActiveVLMWaypoint("frontier_oracle_blocked_downstairs");
+    ROS_ERROR("[FrontierOracle] No-downstairs constraint blocked this episode; returning NO_PASSABLE_FRONTIER.");
+    return NO_PASSABLE_FRONTIER;
+  }
+
+  if (pending_vlm_forced_action_steps_ > 0 && next_best_path.empty()) {
+    ed_->next_pos_ = pos2d;
+    ed_->next_best_path_.clear();
+    return EXPLORATION;
+  }
+
+  // Handle case when no passable frontiers are found
+  if (next_best_path.empty()) {
+    ROS_WARN("Maybe no passable frontier.");
+
+    // Try suspicious objects as backup
+    if (object_shortcut_enabled && !top_object_cloud->points.empty() &&
+        searchObjectPath(pos, top_object_cloud, ed_->next_pos_, ed_->next_best_path_)) {
+      clearActiveVLMWaypoint("suspicious_object");
+      return SEARCH_SUSPICIOUS_OBJECT;
+    }
+    else
+      // Try dormant frontiers as last resort
+      chooseExplorationPolicy(
+          pos2d, yaw, ed_->dormant_frontier_averages_, next_best_pos, next_best_path);
+
+    // Extreme search mode when all normal options fail
+    if (next_best_path.empty()) {
+      ROS_ERROR("search exterme case!!!");
+
+      // Try extreme object search with relaxed constraints
+      for (auto object_cloud : object_clouds) {
+        if (object_shortcut_enabled && !object_cloud->points.empty() &&
+            searchObjectPathExtreme(pos, object_cloud, ed_->next_pos_, ed_->next_best_path_)) {
+          clearActiveVLMWaypoint("extreme_object");
+          return SEARCH_EXTREME;
+        }
+      }
+
+      // Include lower confidence objects in extreme search
+      sdf_map_->object_map2d_->getTopConfidenceObjectCloud(object_clouds, false, true);
+      for (auto object_cloud : object_clouds) {
+        if (object_shortcut_enabled && !object_cloud->points.empty() &&
+            searchObjectPathExtreme(pos, object_cloud, ed_->next_pos_, ed_->next_best_path_)) {
+          clearActiveVLMWaypoint("extreme_low_confidence_object");
+          return SEARCH_EXTREME;
+        }
+      }
+
+      // Try cached over-depth objects as final option
+      static auto last_over_depth_object_cloud = object_map2d_->over_depth_object_cloud_;
+      if (!object_map2d_->over_depth_object_cloud_->points.empty())
+        last_over_depth_object_cloud = object_map2d_->over_depth_object_cloud_;
+
+      if (object_shortcut_enabled && !last_over_depth_object_cloud->points.empty() &&
+          searchObjectPathExtreme(
+              pos, last_over_depth_object_cloud, ed_->next_pos_, ed_->next_best_path_)) {
+        clearActiveVLMWaypoint("extreme_cached_over_depth_object");
+        return SEARCH_EXTREME;
+      }
+    }
+
+    // Final error handling when no valid targets exist
+    if (next_best_path.empty()) {
+      if (ed_->frontiers_.empty()) {
+        ROS_ERROR("No coverable frontier!!");
+        return NO_COVERABLE_FRONTIER;
+      }
+      else {
+        ROS_ERROR("No passable frontier!!");
+        return NO_PASSABLE_FRONTIER;
+      }
+    }
+  }
+
+  // Store successful planning results
+  ed_->next_pos_ = next_best_pos;
+  ed_->next_best_path_ = next_best_path;
+
+  // Performance monitoring
+  double total_time = (ros::Time::now() - t2).toSec();
+  ROS_ERROR_COND(total_time > 0.25, "[Plan NBV] Total time %.2lf s too long!!!", total_time);
+
+  if (vlm_selected_target_object_proxy_in_last_plan_) {
+    if (ep_->vlm_defer_target_object_proxy_search_until_reached_ &&
+        !vlm_target_object_proxy_ready_to_stop_) {
+      ROS_WARN("[VLM Target] VLM selected target_object_proxy; deferring SEARCH_BEST_OBJECT "
+               "until the selected waypoint is reached. goal=(%.2f, %.2f), path_size=%zu",
+          ed_->next_pos_(0), ed_->next_pos_(1), ed_->next_best_path_.size());
+      return EXPLORATION;
+    }
+    ROS_WARN("[VLM Target] VLM selected target_object_proxy; returning SEARCH_BEST_OBJECT "
+             "with goal=(%.2f, %.2f), path_size=%zu, ready_to_stop=true",
+        ed_->next_pos_(0), ed_->next_pos_(1), ed_->next_best_path_.size());
+    return SEARCH_BEST_OBJECT;
+  }
+
+  return EXPLORATION;
+}
+
+void ExplorationManager::clearActiveVLMWaypoint(const string& reason)
+{
+  const bool reached_target_object_proxy = active_vlm_target_object_proxy_ &&
+      (reason == "reached" || reason == "near_reached_stalled");
+  if (active_vlm_waypoint_) {
+    ROS_WARN("[VLM Waypoint] Clear active waypoint %s goal=(%.2f, %.2f), reason=%s",
+        active_vlm_selected_id_.c_str(), active_vlm_goal_(0), active_vlm_goal_(1),
+        reason.c_str());
+    if (reached_target_object_proxy) {
+      vlm_target_object_proxy_ready_to_stop_ = true;
+      ROS_WARN("[VLM Target] target_object_proxy waypoint reached; next target-confirming "
+               "selection may return SEARCH_BEST_OBJECT.");
+    }
+    else if (active_vlm_target_object_proxy_) {
+      vlm_target_object_proxy_ready_to_stop_ = false;
+    }
+    if (isCriticOnlyDebugMode() && critic_pending_.active &&
+        critic_pending_.selected_action == "SELECT_WAYPOINT") {
+      finalizePendingCriticDecision(critic_last_planning_pos_, "active_waypoint_cleared_" + reason);
+    }
+  }
+  active_vlm_waypoint_ = false;
+  active_vlm_goal_ = Vector2d::Zero();
+  active_vlm_path_.clear();
+  active_vlm_selected_id_.clear();
+  active_vlm_follow_steps_ = 0;
+  active_vlm_best_distance_ = std::numeric_limits<double>::infinity();
+  active_vlm_stall_steps_ = 0;
+  active_vlm_target_object_proxy_ = false;
+  resetVLMScanContext("clear_active_" + reason);
+}
+
+bool ExplorationManager::hasActiveVLMWaypoint() const
+{
+  return active_vlm_waypoint_;
+}
+
+bool ExplorationManager::consumePendingVLMForcedAction(int& action_code)
+{
+  if (pending_vlm_forced_action_steps_ <= 0 || pending_vlm_forced_action_ < 0)
+    return false;
+
+  action_code = pending_vlm_forced_action_;
+  pending_vlm_forced_action_steps_--;
+  ROS_WARN("[VLM Scan] Execute forced look action=%d, remaining_turn_steps=%d", action_code,
+      pending_vlm_forced_action_steps_);
+  if (pending_vlm_forced_action_steps_ <= 0)
+    pending_vlm_forced_action_ = -1;
+  return true;
+}
+
+bool ExplorationManager::consumeReachedVLMTargetObjectProxyStop()
+{
+  if (!vlm_target_object_proxy_ready_to_stop_)
+    return false;
+
+  vector<pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>> target_clouds;
+  if (object_map2d_)
+    object_map2d_->getTopConfidenceObjectCloud(target_clouds);
+
+  size_t target_point_count = 0;
+  for (const auto& cloud : target_clouds) {
+    if (cloud)
+      target_point_count += cloud->points.size();
+  }
+
+  // The stop latch is created only after the model selected a target_object_proxy and
+  // the controller reached it. Require persistent detector-map evidence as the final
+  // confirmation, but do not require the now-reached proxy to be generated a second time.
+  if (target_point_count == 0) {
+    vlm_target_object_proxy_ready_to_stop_ = false;
+    ROS_WARN("[VLM Target] Reached target_object_proxy but persistent target-map evidence is empty; "
+             "clear stop latch and require a new model-confirmed target proxy.");
+    return false;
+  }
+
+  vlm_target_object_proxy_ready_to_stop_ = false;
+  ROS_WARN("[VLM Target] Consume reached target_object_proxy stop latch with persistent "
+           "target-map evidence: clouds=%zu, points=%zu",
+      target_clouds.size(), target_point_count);
+  return true;
+}
+
+void ExplorationManager::setActiveVLMWaypoint(
+    const string& selected_id, const Vector2d& goal, const vector<Vector2d>& path,
+    bool target_object_proxy)
+{
+  vlm_selected_target_object_proxy_in_last_plan_ = target_object_proxy;
+  if (!ep_->use_vlm_guided_geometric_ || !ep_->vlm_hold_selected_goal_ || path.empty())
+    return;
+  if (!target_object_proxy)
+    vlm_target_object_proxy_ready_to_stop_ = false;
+
+  active_vlm_waypoint_ = true;
+  active_vlm_goal_ = goal;
+  active_vlm_path_ = path;
+  active_vlm_selected_id_ = selected_id;
+  active_vlm_follow_steps_ = 0;
+  active_vlm_best_distance_ = std::numeric_limits<double>::infinity();
+  active_vlm_stall_steps_ = 0;
+  active_vlm_target_object_proxy_ = target_object_proxy;
+  const double effective_reach_distance =
+      active_vlm_target_object_proxy_ ? ep_->vlm_target_goal_reached_distance_
+                                      : ep_->vlm_goal_reached_distance_;
+  ROS_WARN("[VLM Waypoint] Hold selected waypoint %s until reached: goal=(%.2f, %.2f), "
+           "reach_distance=%.2f, target_reach_distance=%.2f, max_follow_steps=%d, release_stalled=%s, "
+           "stall_grace=%d, stall_max=%d, stall_min_progress=%.2f, "
+           "near_reached=%s/%.2f/%d, "
+           "target_object_proxy=%s",
+      active_vlm_selected_id_.c_str(), active_vlm_goal_(0), active_vlm_goal_(1),
+      effective_reach_distance, ep_->vlm_target_goal_reached_distance_,
+      ep_->vlm_goal_max_follow_steps_,
+      ep_->vlm_release_stalled_waypoint_ ? "true" : "false",
+      ep_->vlm_goal_stall_grace_steps_, ep_->vlm_goal_stall_max_steps_,
+      ep_->vlm_goal_stall_min_progress_,
+      ep_->vlm_clear_near_reached_stalled_waypoint_ ? "true" : "false",
+      ep_->vlm_goal_near_reached_distance_, ep_->vlm_goal_near_reached_stall_steps_,
+      active_vlm_target_object_proxy_ ? "true" : "false");
+}
+
+bool ExplorationManager::continueActiveVLMWaypoint(const Vector2d& cur_pos)
+{
+  if (!ep_->use_vlm_guided_geometric_ || !ep_->vlm_hold_selected_goal_ || !active_vlm_waypoint_)
+    return false;
+
+  const double distance_to_goal = (cur_pos - active_vlm_goal_).norm();
+  const double effective_reach_distance =
+      active_vlm_target_object_proxy_ ? ep_->vlm_target_goal_reached_distance_
+                                      : ep_->vlm_goal_reached_distance_;
+  if (distance_to_goal <= effective_reach_distance) {
+    clearActiveVLMWaypoint("reached");
+    return false;
+  }
+
+  if (active_vlm_path_.empty()) {
+    clearActiveVLMWaypoint("empty_path");
+    return false;
+  }
+
+  if (ep_->vlm_release_stalled_waypoint_) {
+    if (!std::isfinite(active_vlm_best_distance_) ||
+        distance_to_goal < active_vlm_best_distance_ - ep_->vlm_goal_stall_min_progress_) {
+      active_vlm_best_distance_ = distance_to_goal;
+      active_vlm_stall_steps_ = 0;
+    }
+    else if (active_vlm_follow_steps_ >= ep_->vlm_goal_stall_grace_steps_) {
+      active_vlm_stall_steps_++;
+    }
+
+    if (ep_->vlm_clear_near_reached_stalled_waypoint_ &&
+        distance_to_goal <= ep_->vlm_goal_near_reached_distance_ &&
+        active_vlm_stall_steps_ >= ep_->vlm_goal_near_reached_stall_steps_) {
+      ROS_WARN("[VLM Waypoint] Clear near-reached stalled waypoint %s: distance=%.2f, "
+               "best_distance=%.2f, stall_steps=%d/%d, follow_step=%d",
+          active_vlm_selected_id_.c_str(), distance_to_goal, active_vlm_best_distance_,
+          active_vlm_stall_steps_, ep_->vlm_goal_near_reached_stall_steps_,
+          active_vlm_follow_steps_);
+      clearActiveVLMWaypoint("near_reached_stalled");
+      return false;
+    }
+
+    if (active_vlm_stall_steps_ >= ep_->vlm_goal_stall_max_steps_) {
+      ROS_WARN("[VLM Waypoint] Release stalled active waypoint %s: distance=%.2f, "
+               "best_distance=%.2f, stall_steps=%d/%d, follow_step=%d",
+          active_vlm_selected_id_.c_str(), distance_to_goal, active_vlm_best_distance_,
+          active_vlm_stall_steps_, ep_->vlm_goal_stall_max_steps_,
+          active_vlm_follow_steps_);
+      clearActiveVLMWaypoint("stalled_no_progress");
+      return false;
+    }
+  }
+
+  if (active_vlm_follow_steps_ >= ep_->vlm_goal_max_follow_steps_) {
+    clearActiveVLMWaypoint("max_follow_steps");
+    return false;
+  }
+
+  ed_->next_pos_ = active_vlm_goal_;
+  ed_->next_best_path_ = active_vlm_path_;
+  vlm_selected_target_object_proxy_in_last_plan_ = active_vlm_target_object_proxy_;
+  active_vlm_follow_steps_++;
+  ROS_WARN("[VLM Waypoint] Continue active waypoint %s goal=(%.2f, %.2f), distance=%.2f, "
+           "best_distance=%.2f, stall_steps=%d/%d, follow_step=%d/%d, "
+           "target_object_proxy=%s",
+      active_vlm_selected_id_.c_str(), active_vlm_goal_(0), active_vlm_goal_(1), distance_to_goal,
+      active_vlm_best_distance_, active_vlm_stall_steps_, ep_->vlm_goal_stall_max_steps_,
+      active_vlm_follow_steps_, ep_->vlm_goal_max_follow_steps_,
+      active_vlm_target_object_proxy_ ? "true" : "false");
+  return true;
+}
+
+void ExplorationManager::chooseExplorationPolicy(Vector2d cur_pos, double cur_yaw,
+    vector<Vector2d> frontiers, Vector2d& next_best_pos, vector<Vector2d>& next_best_path)
+{
+  switch (ep_->policy_mode_) {
+    case ExplorationParam::DISTANCE:
+      ROS_WARN("[Exploration Mode] Find Closest Frontier");
+      if (ep_->use_vlm_guided_geometric_)
+        findVLMGuidedFrontierPolicy(cur_pos, cur_yaw, frontiers, next_best_pos, next_best_path);
+      else {
+        resetVLMScanContext("original_geometric_disabled");
+        findClosestFrontierPolicy(cur_pos, frontiers, next_best_pos, next_best_path);
+      }
+      break;
+
+    case ExplorationParam::SEMANTIC:
+      ROS_WARN("[Exploration Mode] Find Highest Semantic Value Frontier");
+      if (!ep_->use_semantic_exploration_) {
+        ROS_WARN("[Exploration Mode] Semantic exploration disabled; use geometric exploration");
+        if (ep_->use_vlm_guided_geometric_)
+          findVLMGuidedFrontierPolicy(cur_pos, cur_yaw, frontiers, next_best_pos, next_best_path);
+        else {
+          resetVLMScanContext("semantic_disabled_original_geometric");
+          findClosestFrontierPolicy(cur_pos, frontiers, next_best_pos, next_best_path);
+        }
+        break;
+      }
+      if (continueActiveVLMWaypoint(cur_pos)) {
+        next_best_pos = ed_->next_pos_;
+        next_best_path = ed_->next_best_path_;
+        ROS_WARN("[VLM Waypoint] Keep active waypoint during semantic policy");
+        break;
+      }
+      resetVLMScanContext("semantic_policy");
+      findHighestSemanticsFrontierPolicy(cur_pos, frontiers, next_best_pos, next_best_path);
+      break;
+
+    case ExplorationParam::HYBRID:
+      ROS_WARN("[Exploration Mode] Working on Hybrid Mode");
+      hybridExplorePolicy(cur_pos, cur_yaw, frontiers, next_best_pos, next_best_path);
+      break;
+
+    case ExplorationParam::TSP_DIST:
+      ROS_WARN("[Exploration Mode] Working on TSP Distance Mode");
+      findTSPTourPolicy(cur_pos, frontiers, next_best_pos, next_best_path);
+      break;
+
+    default:
+      ROS_WARN("[Exploration Mode] Unknown Mode");
+      break;
+  }
+}
+
+void ExplorationManager::hybridExplorePolicy(Vector2d cur_pos, double cur_yaw,
+    vector<Vector2d> frontiers, Vector2d& next_best_pos, vector<Vector2d>& next_best_path)
+{
+  if (!ep_->use_semantic_exploration_) {
+    if (ep_->use_vlm_guided_geometric_) {
+      ROS_WARN("[Exploration Mode] Semantic exploration disabled; use VLM-guided geometric");
+      findVLMGuidedFrontierPolicy(cur_pos, cur_yaw, frontiers, next_best_pos, next_best_path);
+    }
+    else {
+      ROS_WARN("[Exploration Mode] Semantic exploration disabled; use closest frontier");
+      resetVLMScanContext("semantic_disabled_original_geometric");
+      findClosestFrontierPolicy(cur_pos, frontiers, next_best_pos, next_best_path);
+    }
+    return;
+  }
+
+  double std_dev_threshold = ep_->sigma_threshold_;
+  double max_to_mean_threshold = ep_->max_to_mean_threshold_;
+  vector<SemanticFrontier> sem_frontiers;
+  getSortedSemanticFrontiers(cur_pos, frontiers, sem_frontiers);
+  if (sem_frontiers.empty()) {
+    if (ep_->use_vlm_guided_geometric_) {
+      ROS_WARN("Explore the environment (VLM-guided geometric)!!");
+      findVLMGuidedFrontierPolicy(cur_pos, cur_yaw, frontiers, next_best_pos, next_best_path);
+    }
+    return;
+  }
+
+  double std_dev, max_to_mean, mean;
+  calcSemanticFrontierInfo(sem_frontiers, std_dev, max_to_mean, mean);
+
+  // Decide between exploitation and exploration based on semantic statistics
+  if (std_dev > std_dev_threshold && max_to_mean > max_to_mean_threshold) {
+    if (continueActiveVLMWaypoint(cur_pos)) {
+      next_best_pos = ed_->next_pos_;
+      next_best_path = ed_->next_best_path_;
+      ROS_WARN("[VLM Waypoint] Keep active waypoint despite semantic_peak");
+      return;
+    }
+    ROS_WARN("Exploit the semantic value (TSP)!!");
+    vector<Vector2d> high_sem_frontiers;
+
+    // Select high-value frontiers for TSP optimization
+    for (auto sem_frontier : sem_frontiers) {
+      double auto_max_to_mean_threshold =
+          max(max_to_mean_threshold, ep_->max_to_mean_percentage_ * max_to_mean);
+      if (sem_frontier.semantic_value / mean < auto_max_to_mean_threshold)
+        break;
+      high_sem_frontiers.push_back(sem_frontier.position);
+    }
+    findTSPTourPolicy(cur_pos, high_sem_frontiers, next_best_pos, next_best_path);
+  }
+  else {
+    if (ep_->use_vlm_guided_geometric_) {
+      ROS_WARN("Explore the environment (VLM-guided geometric)!!");
+      findVLMGuidedFrontierPolicy(cur_pos, cur_yaw, frontiers, next_best_pos, next_best_path);
+    }
+    else {
+      ROS_WARN("Explore the environment (Closest)!!");
+      resetVLMScanContext("original_geometric_disabled");
+      findClosestFrontierPolicy(cur_pos, frontiers, next_best_pos, next_best_path);
+    }
+  }
+}
+
+void ExplorationManager::findHighestSemanticsFrontierPolicy(Vector2d cur_pos,
+    vector<Vector2d> frontiers, Vector2d& next_best_pos, vector<Vector2d>& next_best_path)
+{
+  next_best_path.clear();
+
+  // Container for frontier-value pairs for sorting
+  vector<pair<Vector2d, double>> frontier_values;
+
+  // Compute semantic value for each frontier
+  for (auto frontier : frontiers) {
+    Vector2i idx;
+    sdf_map_->posToIndex(frontier, idx);
+    auto nbrs = allNeighbors(idx, 2);  // 5x5 neighborhood
+
+    // Find maximum semantic value in local neighborhood
+    double value = sdf_map_->value_map_->getValue(idx);
+    for (auto nbr : nbrs) value = max(value, sdf_map_->value_map_->getValue(nbr));
+
+    frontier_values.emplace_back(frontier, value);
+  }
+
+  // Sort by semantic value (descending), then by distance (ascending)
+  auto compareFrontiers = [&cur_pos](
+                              const pair<Vector2d, double>& a, const pair<Vector2d, double>& b) {
+    if (fabs(a.second - b.second) > 1e-5) {
+      return a.second > b.second;  // Higher semantic value first
+    }
+    else {
+      double dist_a = (a.first - cur_pos).norm();
+      double dist_b = (b.first - cur_pos).norm();
+      return dist_a < dist_b;  // Closer distance first for tie-breaking
+    }
+  };
+
+  std::sort(frontier_values.begin(), frontier_values.end(), compareFrontiers);
+
+  // Update frontier list with sorted order
+  frontiers.clear();
+  for (const auto& fv : frontier_values) {
+    frontiers.push_back(fv.first);
+  }
+
+  // Select first reachable frontier from sorted list
+  for (int i = 0; i < (int)frontiers.size(); i++) {
+    std::vector<Eigen::Vector2d> tmp_path;
+    Eigen::Vector2d tmp_pos;
+    if (!searchFrontierPath(cur_pos, frontiers[i], tmp_pos, tmp_path))
+      continue;
+    next_best_pos = tmp_pos;
+    next_best_path = tmp_path;
+    break;
+  }
+}
+
+void ExplorationManager::findClosestFrontierPolicy(Vector2d cur_pos, vector<Vector2d> frontiers,
+    Vector2d& next_best_pos, vector<Vector2d>& next_best_path)
+{
+  next_best_path.clear();
+
+  // Sort frontiers by Euclidean distance for efficient processing
+  std::sort(frontiers.begin(), frontiers.end(), [&cur_pos](const Vector2d& a, const Vector2d& b) {
+    return (a - cur_pos).norm() < (b - cur_pos).norm();
+  });
+
+  double min_len = std::numeric_limits<double>::max();
+
+  // Find the frontier with shortest actual path length
+  for (int i = 0; i < (int)frontiers.size(); i++) {
+    // Skip if Euclidean distance already exceeds best path length
+    if ((frontiers[i] - cur_pos).norm() >= min_len)
+      continue;
+
+    std::vector<Eigen::Vector2d> tmp_path;
+    Eigen::Vector2d tmp_pos;
+
+    // Attempt path planning to this frontier
+    if (!searchFrontierPath(cur_pos, frontiers[i], tmp_pos, tmp_path))
+      continue;
+
+    // Update best solution if this path is shorter
+    double len = Astar2D::pathLength(tmp_path);
+    if (len < min_len) {
+      min_len = len;
+      next_best_pos = tmp_pos;
+      next_best_path = tmp_path;
+    }
+  }
+}
+
+
+void ExplorationManager::rgbCallback(const sensor_msgs::ImageConstPtr& msg)
+{
+  try {
+    cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(msg);
+    if (!cv_ptr || cv_ptr->image.empty())
+      return;
+
+    cv::Mat bgr_image;
+    const int channels = cv_ptr->image.channels();
+    if (channels == 3 && msg->encoding == sensor_msgs::image_encodings::RGB8)
+      cv::cvtColor(cv_ptr->image, bgr_image, cv::COLOR_RGB2BGR);
+    else if (channels == 3)
+      bgr_image = cv_ptr->image.clone();
+    else if (channels == 4)
+      cv::cvtColor(cv_ptr->image, bgr_image, cv::COLOR_BGRA2BGR);
+    else if (channels == 1)
+      cv::cvtColor(cv_ptr->image, bgr_image, cv::COLOR_GRAY2BGR);
+    else
+      return;
+
+    latest_rgb_image_ = bgr_image.clone();
+    have_latest_rgb_ = true;
+  }
+  catch (const std::exception& e) {
+    ROS_WARN_THROTTLE(2.0, "[VLM Waypoint] Failed to cache RGB image: %s", e.what());
+  }
+}
+
+void ExplorationManager::depthCallback(const sensor_msgs::ImageConstPtr& msg)
+{
+  try {
+    cv_bridge::CvImageConstPtr cv_ptr = cv_bridge::toCvShare(msg);
+    if (!cv_ptr || cv_ptr->image.empty())
+      return;
+
+    cv::Mat depth_float;
+    cv::Mat depth_meters;
+    if (cv_ptr->image.channels() == 1) {
+      if (cv_ptr->image.type() == CV_32FC1)
+        depth_float = cv_ptr->image.clone();
+      else if (cv_ptr->image.type() == CV_16UC1)
+        cv_ptr->image.convertTo(depth_float, CV_32FC1, 1.0 / 65535.0);
+      else if (cv_ptr->image.type() == CV_8UC1)
+        cv_ptr->image.convertTo(depth_float, CV_32FC1, 1.0 / 255.0);
+      else
+        cv_ptr->image.convertTo(depth_float, CV_32FC1);
+
+      if (ep_->vlm_local_view_depth_is_normalized_) {
+        const double depth_range = std::max(1e-3,
+            ep_->vlm_local_view_max_depth_m_ - ep_->vlm_local_view_depth_min_m_);
+        depth_meters = depth_float * depth_range + ep_->vlm_local_view_depth_min_m_;
+      }
+      else {
+        depth_meters = depth_float.clone();
+      }
+      latest_depth_meters_ = depth_meters.clone();
+      have_latest_depth_meters_ = true;
+
+      cv::Mat valid_mask = depth_meters == depth_meters;
+      valid_mask &= depth_meters > ep_->vlm_local_view_depth_min_m_;
+      double min_val = 0.0, max_val = 0.0;
+      cv::minMaxLoc(depth_meters, &min_val, &max_val, nullptr, nullptr, valid_mask);
+      if (max_val <= min_val) {
+        min_val = 0.0;
+        max_val = std::max(1.0, ep_->vlm_local_view_max_depth_m_);
+      }
+      cv::Mat depth_norm;
+      depth_meters.convertTo(depth_norm, CV_8UC1, 255.0 / (max_val - min_val),
+          -255.0 * min_val / (max_val - min_val));
+      depth_norm.setTo(0, ~valid_mask);
+      cv::applyColorMap(depth_norm, latest_depth_viz_image_, cv::COLORMAP_TURBO);
+    }
+    else if (cv_ptr->image.channels() == 3) {
+      latest_depth_viz_image_ = cv_ptr->image.clone();
+      have_latest_depth_meters_ = false;
+      latest_depth_meters_.release();
+    }
+    else if (cv_ptr->image.channels() == 4) {
+      cv::cvtColor(cv_ptr->image, latest_depth_viz_image_, cv::COLOR_BGRA2BGR);
+      have_latest_depth_meters_ = false;
+      latest_depth_meters_.release();
+    }
+    else {
+      return;
+    }
+
+    have_latest_depth_ = true;
+  }
+  catch (const std::exception& e) {
+    ROS_WARN_THROTTLE(2.0, "[VLM Waypoint] Failed to cache depth image: %s", e.what());
+  }
+}
+
+void ExplorationManager::targetLabelCallback(const std_msgs::StringConstPtr& msg)
+{
+  if (!msg->data.empty())
+    target_label_ = msg->data;
+}
+
+void ExplorationManager::progressCallback(const std_msgs::Int32MultiArrayConstPtr& msg)
+{
+  if (!msg->data.empty()) {
+    const int new_episode_id = msg->data[0];
+    if (isCriticOnlyDebugMode() && critic_stats_.episode_id != -1 &&
+        critic_stats_.episode_id != new_episode_id) {
+      writeCriticEpisodeSummary("episode_progress_changed");
+    }
+    if (isCriticOnlyDebugMode() && critic_stats_.episode_id != new_episode_id)
+      resetCriticEpisodeStats(new_episode_id);
+    if (episode_index_ != -1 && episode_index_ != new_episode_id)
+      resetInitialVLMPanorama("episode_progress_changed");
+    if (episode_index_ != -1 && episode_index_ != new_episode_id) {
+      vlm_recent_goals_.clear();
+      vlm_recent_open_view_poses_.clear();
+      oracle_frontier_blocked_downstairs_ = false;
+      oracle_downstairs_required_ = false;
+      oracle_target_path_downward_drop_ = 0.0;
+      oracle_target_path_endpoint_height_delta_ = 0.0;
+    }
+    episode_index_ = msg->data[0];
+  }
+}
+
+void ExplorationManager::criticGTCallback(const std_msgs::Float64MultiArrayConstPtr& msg)
+{
+  if (msg->data.size() < 8)
+    return;
+
+  critic_gt_episode_id_ = static_cast<int>(std::round(msg->data[0]));
+  critic_gt_step_id_ = static_cast<int>(std::round(msg->data[1]));
+
+  const double geodesic_distance = msg->data[2];
+  critic_have_geodesic_distance_ = std::isfinite(geodesic_distance) && geodesic_distance >= 0.0;
+  critic_geodesic_distance_ = critic_have_geodesic_distance_ ? geodesic_distance : -1.0;
+
+  const bool has_target_position = msg->data[5] > 0.5;
+  const double target_x = msg->data[3];
+  const double target_y = msg->data[4];
+  critic_have_target_position_ =
+      has_target_position && std::isfinite(target_x) && std::isfinite(target_y);
+  if (critic_have_target_position_)
+    critic_target_position_ = Vector2d(target_x, target_y);
+
+  const double endpoint_to_gt_path = msg->data[6];
+  critic_have_endpoint_to_gt_path_ =
+      msg->data[7] > 0.5 && std::isfinite(endpoint_to_gt_path) && endpoint_to_gt_path >= 0.0;
+  critic_endpoint_to_gt_path_ =
+      critic_have_endpoint_to_gt_path_ ? endpoint_to_gt_path : -1.0;
+}
+
+void ExplorationManager::habitatStateCallback(const std_msgs::Int32ConstPtr& msg)
+{
+  constexpr int kHabitatEpisodeFinish = 3;
+  if (msg->data == kHabitatEpisodeFinish && isCriticOnlyDebugMode())
+    writeCriticEpisodeSummary("habitat_episode_finish");
+  if (msg->data == kHabitatEpisodeFinish) {
+    resetInitialVLMPanorama("habitat_episode_finish");
+    vlm_recent_goals_.clear();
+    vlm_recent_open_view_poses_.clear();
+    oracle_frontier_blocked_downstairs_ = false;
+    oracle_downstairs_required_ = false;
+    oracle_target_path_downward_drop_ = 0.0;
+    oracle_target_path_endpoint_height_delta_ = 0.0;
+  }
+}
+
+string ExplorationManager::directionLabel(
+    const Vector2d& cur_pos, double cur_yaw, const Vector2d& goal) const
+{
+  double angle = std::atan2(goal(1) - cur_pos(1), goal(0) - cur_pos(0)) - cur_yaw;
+  while (angle > M_PI) angle -= 2.0 * M_PI;
+  while (angle < -M_PI) angle += 2.0 * M_PI;
+
+  const double deg = angle * 180.0 / M_PI;
+  if (deg >= -22.5 && deg < 22.5)
+    return "front";
+  if (deg >= 22.5 && deg < 67.5)
+    return "front-left";
+  if (deg >= 67.5 && deg < 112.5)
+    return "left";
+  if (deg >= 112.5 && deg < 157.5)
+    return "back-left";
+  if (deg >= -67.5 && deg < -22.5)
+    return "front-right";
+  if (deg >= -112.5 && deg < -67.5)
+    return "right";
+  if (deg >= -157.5 && deg < -112.5)
+    return "back-right";
+  return "back";
+}
+
+int ExplorationManager::estimateFrontierSize(const Vector2d& frontier) const
+{
+  int best_size = 1;
+  double best_dist = std::numeric_limits<double>::max();
+
+  auto updateBest = [&](const vector<Vector2d>& averages, const vector<vector<Vector2d>>& clusters) {
+    for (size_t i = 0; i < averages.size() && i < clusters.size(); ++i) {
+      const double dist = (averages[i] - frontier).norm();
+      if (dist < best_dist) {
+        best_dist = dist;
+        best_size = static_cast<int>(clusters[i].size());
+      }
+    }
+  };
+
+  if (ed_) {
+    updateBest(ed_->frontier_averages_, ed_->frontiers_);
+    updateBest(ed_->dormant_frontier_averages_, ed_->dormant_frontiers_);
+  }
+  return best_size;
+}
+
+bool ExplorationManager::isRecentlySelectedGoal(const Vector2d& goal) const
+{
+  for (const auto& recent_goal : vlm_recent_goals_) {
+    if ((recent_goal - goal).norm() < ep_->vlm_recent_goal_radius_)
+      return true;
+  }
+  return false;
+}
+
+bool ExplorationManager::isRejectedByVLMScan(const Vector2d& goal) const
+{
+  // Scanning should accumulate candidate options, not suppress nearby unselected ones.
+  (void)goal;
+  return false;
+}
+
+void ExplorationManager::rememberSelectedGoal(const Vector2d& goal)
+{
+  vlm_recent_goals_.push_back(goal);
+  const size_t max_recent_goals = 20;
+  if (vlm_recent_goals_.size() > max_recent_goals)
+    vlm_recent_goals_.erase(vlm_recent_goals_.begin());
+}
+
+void ExplorationManager::rememberVLMScanRejectedCandidates(
+    const vector<VLMWaypointCandidate>& candidates, const string& selected_id)
+{
+  (void)candidates;
+  (void)selected_id;
+  vlm_scan_rejected_goals_.clear();
+}
+
+vector<VLMWaypointCandidate> ExplorationManager::buildVLMWaypointCandidates(
+    const Vector2d& cur_pos, double cur_yaw, const vector<Vector2d>& frontiers)
+{
+  vector<VLMWaypointCandidate> preferred;
+  vector<VLMWaypointCandidate> recent;
+  vector<VLMWaypointCandidate> long_range;
+  vector<VLMWaypointCandidate> connector_proxy;
+  vector<VLMWaypointCandidate> target_object_proxy;
+  vlm_last_low_clearance_filtered_candidates_.clear();
+  vlm_last_high_path_ratio_filtered_candidates_.clear();
+  vlm_last_scan_rejected_filtered_candidates_.clear();
+  vlm_last_candidate_count_before_clearance_filter_ = 0;
+  vlm_last_candidate_count_after_clearance_filter_ = 0;
+  vlm_last_candidate_count_before_path_ratio_filter_ = 0;
+  vlm_last_candidate_count_after_path_ratio_filter_ = 0;
+  vlm_last_candidate_count_before_scan_reject_filter_ = 0;
+  vlm_last_candidate_count_after_scan_reject_filter_ = 0;
+  const int image_width = have_latest_rgb_ && !latest_rgb_image_.empty()
+      ? latest_rgb_image_.cols
+      : std::max(1, static_cast<int>(std::round(ep_->vlm_camera_cx_ * 2.0)));
+  const int image_height = have_latest_rgb_ && !latest_rgb_image_.empty()
+      ? latest_rgb_image_.rows
+      : std::max(1, static_cast<int>(std::round(ep_->vlm_camera_cy_ * 2.0)));
+
+  struct CandidateSource {
+    Vector2d position;
+    int frontier_size;
+    string source;
+    vector<Vector2d> cluster_points;
+  };
+  vector<CandidateSource> candidate_sources;
+
+  auto addSource = [&](const Vector2d& position, int frontier_size, const string& source_name,
+                       const vector<Vector2d>* cluster_points = nullptr) {
+    for (auto& existing_source : candidate_sources) {
+      if ((existing_source.position - position).norm() < 0.25) {
+        if (existing_source.cluster_points.empty() && cluster_points && !cluster_points->empty())
+          existing_source.cluster_points = *cluster_points;
+        return;
+      }
+    }
+    CandidateSource source;
+    source.position = position;
+    source.frontier_size = std::max(1, frontier_size);
+    source.source = source_name;
+    if (cluster_points)
+      source.cluster_points = *cluster_points;
+    candidate_sources.push_back(source);
+  };
+
+  for (const auto& frontier : frontiers)
+    addSource(frontier, estimateFrontierSize(frontier), "frontier", nullptr);
+
+  auto addClusterSources = [&](const vector<Vector2d>& averages,
+                               const vector<vector<Vector2d>>& clusters) {
+    for (size_t i = 0; i < clusters.size(); ++i) {
+      const int frontier_size = static_cast<int>(clusters[i].size());
+      if (i < averages.size())
+        addSource(averages[i], frontier_size, "frontier_cluster_average", &clusters[i]);
+      if (clusters[i].empty())
+        continue;
+
+      const int max_samples = std::max(3, ep_->vlm_max_candidates_);
+      const int stride = std::max(1, static_cast<int>(clusters[i].size()) / max_samples);
+      int added = 0;
+      for (size_t j = 0; j < clusters[i].size() && added < max_samples; j += stride) {
+        addSource(clusters[i][j], frontier_size, "frontier_cluster_sample", &clusters[i]);
+        ++added;
+      }
+      addSource(clusters[i].back(), frontier_size, "frontier_cluster_endpoint", &clusters[i]);
+    }
+  };
+
+  if (ed_) {
+    addClusterSources(ed_->frontier_averages_, ed_->frontiers_);
+    addClusterSources(ed_->dormant_frontier_averages_, ed_->dormant_frontiers_);
+  }
+
+  auto safeGoalDuplicated = [&](const Vector2d& safe_goal) {
+    auto duplicatedIn = [&](const vector<VLMWaypointCandidate>& candidates) {
+      for (const auto& candidate : candidates) {
+        if ((candidate.safe_goal - safe_goal).norm() < 0.20)
+          return true;
+      }
+      return false;
+    };
+    return duplicatedIn(preferred) || duplicatedIn(recent) || duplicatedIn(long_range) ||
+        duplicatedIn(connector_proxy) || duplicatedIn(target_object_proxy);
+  };
+
+	  auto makeExecutableGoal = [&](const vector<Vector2d>& raw_path, Vector2d& executable_goal,
+	                                vector<Vector2d>& executable_path, double& clearance) {
+    if (raw_path.size() < 2)
+      return false;
+
+    for (int i = static_cast<int>(raw_path.size()) - 1; i >= 1; --i) {
+      const Vector2d& point = raw_path[i];
+      if (!sdf_map_->isInMap(point))
+        continue;
+
+      const auto occ = sdf_map_->getOccupancy(point);
+      if (occ == SDFMap2D::OCCUPIED || occ == SDFMap2D::UNKNOWN ||
+          sdf_map_->getInflateOccupancy(point) == 1)
+        continue;
+
+      const double point_clearance = sdf_map_->getDistance(point);
+      if (point_clearance >= 0.0 && point_clearance < ep_->vlm_min_clearance_)
+        continue;
+
+      executable_goal = point;
+      executable_path.assign(raw_path.begin(), raw_path.begin() + i + 1);
+      clearance = point_clearance;
+      return true;
+    }
+
+	    return false;
+	  };
+
+  auto tryAddConnectorProxy = [&](const VLMWaypointCandidate& base_candidate) {
+    if (!ep_->vlm_recovery_candidates_enabled_ || base_candidate.path.size() < 2)
+      return;
+
+    VLMWaypointCandidate best_proxy;
+    double best_proxy_score = -std::numeric_limits<double>::infinity();
+    bool have_proxy = false;
+    const double min_dist =
+        std::max(ep_->vlm_min_candidate_distance_, ep_->vlm_recovery_min_distance_);
+    const double max_dist =
+        std::max(min_dist, std::min(ep_->vlm_recovery_max_distance_, 2.6));
+
+    for (size_t i = 1; i < base_candidate.path.size(); ++i) {
+      const Vector2d& point = base_candidate.path[i];
+      if (!sdf_map_->isInMap(point))
+        continue;
+      const double euclidean = (point - cur_pos).norm();
+      if (euclidean < min_dist)
+        continue;
+      if (euclidean > max_dist)
+        break;
+      const int occ = sdf_map_->getOccupancy(point);
+      if (occ == SDFMap2D::UNKNOWN || occ == SDFMap2D::OCCUPIED ||
+          sdf_map_->getInflateOccupancy(point) == 1)
+        continue;
+      const double clearance = sdf_map_->getDistance(point);
+      if (clearance >= 0.0 && clearance < ep_->vlm_recovery_min_clearance_)
+        continue;
+      if (safeGoalDuplicated(point) || isRejectedByVLMScan(point))
+        continue;
+
+      int image_u = -1;
+      int image_v = -1;
+      double projected_depth = -1.0;
+      bool projection_proxy = false;
+      double projection_proxy_depth = -1.0;
+      string projection_type = "none";
+      bool projected = projectCandidateToImageWithGroundProxy(cur_pos, cur_yaw, point,
+          image_width, image_height, image_u, image_v, projected_depth, projection_proxy,
+          projection_proxy_depth);
+      if (projected) {
+        projection_type = projection_proxy ? "ground_ray_proxy" : "exact";
+      }
+      else if (projectCandidateToImageWithEdgeProxy(cur_pos, cur_yaw, point, image_width,
+                   image_height, image_u, image_v, projected_depth, projection_proxy_depth)) {
+        projected = true;
+        projection_proxy = true;
+        projection_type = "edge_proxy";
+      }
+      if (!projected)
+        continue;
+
+      vector<Vector2d> prefix_path(base_candidate.path.begin(),
+          base_candidate.path.begin() + static_cast<long>(i) + 1);
+      const double path_length = Astar2D::pathLength(prefix_path);
+      const double path_ratio = euclidean > 1e-3
+          ? path_length / euclidean
+          : std::numeric_limits<double>::max();
+      if (!std::isfinite(path_ratio) || path_ratio > ep_->vlm_recovery_path_ratio_max_)
+        continue;
+
+      const double clearance_score = clearance >= 0.0
+          ? std::min(1.0, clearance / std::max(0.25, 2.5 * ep_->vlm_recovery_min_clearance_))
+          : 0.5;
+      const double path_score = std::min(1.0, std::max(0.0,
+          1.0 - (path_ratio - 1.0) /
+              std::max(1e-3, ep_->vlm_recovery_path_ratio_max_ - 1.0)));
+      const double projection_score = projection_type == "exact" ? 1.0 :
+          (projection_type == "ground_ray_proxy" ? 0.8 : 0.58);
+      const double distance_score = std::min(1.0, std::max(0.0,
+          1.0 - std::fabs(euclidean - 1.2) / std::max(1.0, max_dist)));
+      const double proxy_score = 0.30 * clearance_score + 0.28 * path_score +
+          0.22 * projection_score + 0.20 * distance_score;
+      if (proxy_score <= best_proxy_score)
+        continue;
+
+      VLMWaypointCandidate proxy = base_candidate;
+      proxy.source = "connector_proxy";
+      proxy.filtered = false;
+      proxy.filtered_reason.clear();
+      proxy.safe_goal = point;
+      proxy.euclidean_distance = euclidean;
+      proxy.path = prefix_path;
+      proxy.path_length = path_length;
+      proxy.path_ratio = path_ratio;
+      proxy.clearance = clearance;
+      proxy.score = proxy_score;
+      proxy.free_distance = euclidean;
+      proxy.sampled_ray_count = static_cast<int>(base_candidate.path.size());
+      proxy.valid = true;
+      proxy.reject_reason.clear();
+      proxy.direction = directionLabel(cur_pos, cur_yaw, point);
+      proxy.reachable = true;
+      proxy.frontier_size = std::max(1, base_candidate.frontier_size);
+      proxy.recently_selected = isRecentlySelectedGoal(point);
+      proxy.has_projection = true;
+      proxy.image_u = image_u;
+      proxy.image_v = image_v;
+      proxy.projected_depth = projected_depth;
+      proxy.projection_type = projection_type;
+      proxy.projection_proxy = projection_proxy;
+      proxy.projection_proxy_depth = projection_proxy_depth;
+
+      best_proxy = proxy;
+      best_proxy_score = proxy_score;
+      have_proxy = true;
+    }
+
+    if (!have_proxy)
+      return;
+
+    connector_proxy.push_back(best_proxy);
+    ROS_WARN("[VLM Connector] Added connector_proxy toward source=%s safe_goal=(%.2f, %.2f), path=%.2f, projection=%s",
+        base_candidate.source.c_str(), best_proxy.safe_goal(0), best_proxy.safe_goal(1),
+        best_proxy.path_length, best_proxy.projection_type.c_str());
+  };
+
+  auto tryAddTargetObjectProxy = [&]() {
+    if (!object_map2d_ || !sdf_map_)
+      return;
+
+    vector<pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>> object_clouds;
+    sdf_map_->object_map2d_->getTopConfidenceObjectCloud(object_clouds);
+    if (object_clouds.empty())
+      return;
+
+    Vector3d start3d(cur_pos(0), cur_pos(1), 0.0);
+    int checked_clouds = 0;
+    for (const auto& object_cloud : object_clouds) {
+      if (!object_cloud || object_cloud->points.empty())
+        continue;
+      checked_clouds++;
+
+      Vector2d object_goal;
+      vector<Vector2d> object_path;
+      if (!searchObjectPath(start3d, object_cloud, object_goal, object_path))
+        continue;
+      if (object_path.empty())
+        continue;
+      if (safeGoalDuplicated(object_goal))
+        continue;
+
+      const double euclidean = (object_goal - cur_pos).norm();
+      if (euclidean < ep_->vlm_min_candidate_distance_)
+        continue;
+      const double path_length = Astar2D::pathLength(object_path);
+      if (!std::isfinite(path_length) || path_length <= 1e-3)
+        continue;
+
+      int image_u = -1;
+      int image_v = -1;
+      double projected_depth = -1.0;
+      bool projection_proxy = false;
+      double projection_proxy_depth = -1.0;
+      string projection_type = "none";
+      bool projected = projectCandidateToImageWithGroundProxy(cur_pos, cur_yaw, object_goal,
+          image_width, image_height, image_u, image_v, projected_depth, projection_proxy,
+          projection_proxy_depth);
+      if (projected) {
+        projection_type = projection_proxy ? "ground_ray_proxy" : "exact";
+      }
+      else if (projectCandidateToImageWithEdgeProxy(cur_pos, cur_yaw, object_goal,
+                   image_width, image_height, image_u, image_v, projected_depth,
+                   projection_proxy_depth)) {
+        projected = true;
+        projection_proxy = true;
+        projection_type = "edge_proxy";
+      }
+      if (!projected)
+        continue;
+
+      VLMWaypointCandidate candidate;
+      candidate.source = "target_object_proxy";
+      candidate.filtered = false;
+      candidate.filtered_reason.clear();
+      candidate.map_position = object_goal;
+      candidate.safe_goal = object_goal;
+      candidate.theta_deg = 0.0;
+      candidate.euclidean_distance = euclidean;
+      candidate.path = object_path;
+      candidate.path_length = path_length;
+      candidate.path_ratio = euclidean > 1e-3
+          ? path_length / euclidean
+          : std::numeric_limits<double>::max();
+      candidate.clearance = sdf_map_->getDistance(object_goal);
+      candidate.score = 10.0;
+      candidate.free_distance = -1.0;
+      candidate.sampled_ray_count = static_cast<int>(object_cloud->points.size());
+      candidate.valid = true;
+      candidate.reject_reason.clear();
+      candidate.direction = directionLabel(cur_pos, cur_yaw, object_goal);
+      candidate.reachable = true;
+      candidate.frontier_size = 300;
+      candidate.recently_selected = isRecentlySelectedGoal(object_goal);
+      candidate.has_projection = true;
+      candidate.image_u = image_u;
+      candidate.image_v = image_v;
+      candidate.projected_depth = projected_depth;
+      candidate.projection_type = projection_type;
+      candidate.projection_proxy = projection_proxy;
+      candidate.projection_proxy_depth = projection_proxy_depth;
+      target_object_proxy.push_back(candidate);
+      ROS_WARN("[VLM Target] Added target_object_proxy safe_goal=(%.2f, %.2f), path=%.2f, clearance=%.2f, projection=%s, cloud_points=%zu",
+          candidate.safe_goal(0), candidate.safe_goal(1), candidate.path_length,
+          candidate.clearance, candidate.projection_type.c_str(), object_cloud->points.size());
+      return;
+    }
+
+    ROS_WARN_THROTTLE(2.0, "[VLM Target] Checked %d target object cloud(s), no visible executable target_object_proxy",
+        checked_clouds);
+  };
+
+  tryAddTargetObjectProxy();
+
+  ROS_WARN("[VLM Waypoint] Build candidates from %lu frontier source point(s)",
+      candidate_sources.size());
+
+  auto trySlideFrontierCandidate = [&](const CandidateSource& source,
+                                       VLMWaypointCandidate& candidate) {
+    vector<Vector2d> slide_cluster = source.cluster_points;
+    if (slide_cluster.empty() && ed_) {
+      const vector<Vector2d>* best_cluster = nullptr;
+      double best_cluster_distance = std::numeric_limits<double>::infinity();
+      auto inspectClusters = [&](const vector<vector<Vector2d>>& clusters) {
+        for (const auto& cluster : clusters) {
+          for (const auto& point : cluster) {
+            const double distance = (point - source.position).norm();
+            if (distance < best_cluster_distance) {
+              best_cluster_distance = distance;
+              best_cluster = &cluster;
+            }
+          }
+        }
+      };
+      inspectClusters(ed_->frontiers_);
+      inspectClusters(ed_->dormant_frontiers_);
+      if (best_cluster && best_cluster_distance <= 1.0)
+        slide_cluster = *best_cluster;
+    }
+    if (slide_cluster.empty())
+      return false;
+    if (std::isfinite(candidate.path_ratio) &&
+        candidate.path_ratio <= ep_->vlm_max_candidate_path_ratio_)
+      return false;
+
+    vector<std::pair<double, int>> ordered_points;
+    ordered_points.reserve(slide_cluster.size());
+    for (int i = 0; i < static_cast<int>(slide_cluster.size()); ++i)
+      ordered_points.emplace_back((slide_cluster[i] - source.position).norm(), i);
+    std::sort(ordered_points.begin(), ordered_points.end(),
+        [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
+          return a.first < b.first;
+        });
+
+    VLMWaypointCandidate best_candidate;
+    double best_score = -std::numeric_limits<double>::infinity();
+    bool have_best = false;
+    const int max_checks =
+        std::max(12, std::min(static_cast<int>(ordered_points.size()), ep_->vlm_max_candidates_ * 4));
+    int checked = 0;
+
+    for (const auto& entry : ordered_points) {
+      if (checked++ >= max_checks)
+        break;
+      const Vector2d& slid_frontier = slide_cluster[entry.second];
+      if ((slid_frontier - source.position).norm() < 1e-3)
+        continue;
+
+      const double raw_distance = (slid_frontier - cur_pos).norm();
+      if (raw_distance < ep_->vlm_min_candidate_distance_)
+        continue;
+
+      Vector2d slid_frontier_goal;
+      vector<Vector2d> raw_path;
+      if (!searchFrontierPath(cur_pos, slid_frontier, slid_frontier_goal, raw_path))
+        continue;
+
+      Vector2d safe_goal;
+      vector<Vector2d> safe_path;
+      double clearance = 0.0;
+      if (!makeExecutableGoal(raw_path, safe_goal, safe_path, clearance))
+        continue;
+
+      const double euclidean = (safe_goal - cur_pos).norm();
+      if (euclidean < ep_->vlm_min_candidate_distance_)
+        continue;
+
+      const double path_length = Astar2D::pathLength(safe_path);
+      const double path_ratio = euclidean > 1e-3
+          ? path_length / euclidean
+          : std::numeric_limits<double>::max();
+      if (!std::isfinite(path_ratio) || path_ratio > ep_->vlm_max_candidate_path_ratio_)
+        continue;
+      if (ep_->vlm_min_candidate_clearance_m_ > 0.0 && clearance >= 0.0 &&
+          clearance < ep_->vlm_min_candidate_clearance_m_)
+        continue;
+      if (safeGoalDuplicated(safe_goal) || isRejectedByVLMScan(safe_goal))
+        continue;
+
+      int image_u = -1;
+      int image_v = -1;
+      double projected_depth = -1.0;
+      bool projection_proxy = false;
+      double projection_proxy_depth = -1.0;
+      string projection_type = "none";
+      bool projected = projectCandidateToImageWithGroundProxy(cur_pos, cur_yaw, safe_goal,
+          image_width, image_height, image_u, image_v, projected_depth, projection_proxy,
+          projection_proxy_depth);
+      if (projected) {
+        projection_type = projection_proxy ? "ground_ray_proxy" : "exact";
+      }
+      else if (projectCandidateToImageWithEdgeProxy(cur_pos, cur_yaw, safe_goal, image_width,
+                   image_height, image_u, image_v, projected_depth, projection_proxy_depth)) {
+        projected = true;
+        projection_proxy = true;
+        projection_type = "edge_proxy";
+      }
+      if (!projected)
+        continue;
+
+      const double path_score = std::min(1.0, std::max(0.0,
+          1.0 - (path_ratio - 1.0) / std::max(1e-3, ep_->vlm_max_candidate_path_ratio_ - 1.0)));
+      const double projection_score =
+          projection_type == "exact" ? 1.0 : (projection_type == "ground_ray_proxy" ? 0.8 : 0.6);
+      const double clearance_score = clearance >= 0.0
+          ? std::min(1.0, clearance / std::max(0.25, 2.5 * ep_->vlm_min_clearance_))
+          : 0.5;
+      const double slide_penalty =
+          std::min(1.0, (slid_frontier - source.position).norm() / 2.0);
+      const double score =
+          0.38 * path_score + 0.30 * projection_score + 0.22 * clearance_score -
+          0.10 * slide_penalty;
+      if (score <= best_score)
+        continue;
+
+      VLMWaypointCandidate refined = candidate;
+      refined.source = "frontier_slid";
+      refined.filtered = false;
+      refined.filtered_reason.clear();
+      refined.map_position = slid_frontier;
+      refined.safe_goal = safe_goal;
+      refined.euclidean_distance = euclidean;
+      refined.frontier_size = source.frontier_size;
+      refined.reachable = true;
+      refined.recently_selected = isRecentlySelectedGoal(safe_goal);
+      refined.path = safe_path;
+      refined.path_length = path_length;
+      refined.path_ratio = path_ratio;
+      refined.direction = directionLabel(cur_pos, cur_yaw, safe_goal);
+      refined.clearance = clearance;
+      refined.free_distance = -1.0;
+      refined.valid = true;
+      refined.reject_reason.clear();
+      refined.has_projection = true;
+      refined.image_u = image_u;
+      refined.image_v = image_v;
+      refined.projected_depth = projected_depth;
+      refined.projection_type = projection_type;
+      refined.projection_proxy = projection_proxy;
+      refined.projection_proxy_depth = projection_proxy_depth;
+      refined.score = score;
+
+      best_candidate = refined;
+      best_score = score;
+      have_best = true;
+    }
+
+    if (!have_best)
+      return false;
+
+    ROS_WARN("[VLM Waypoint] Slid high-path-ratio frontier source=%s raw=(%.2f, %.2f) old_goal=(%.2f, %.2f) old_ratio=%.2f -> slid_raw=(%.2f, %.2f) safe_goal=(%.2f, %.2f), path=%.2f, ratio=%.2f, projection=%s",
+        candidate.source.c_str(), source.position(0), source.position(1), candidate.safe_goal(0),
+        candidate.safe_goal(1), candidate.path_ratio, best_candidate.map_position(0),
+        best_candidate.map_position(1), best_candidate.safe_goal(0), best_candidate.safe_goal(1),
+        best_candidate.path_length, best_candidate.path_ratio,
+        best_candidate.projection_type.c_str());
+    candidate = best_candidate;
+    return true;
+  };
+
+  for (const auto& source : candidate_sources) {
+    const Vector2d& frontier = source.position;
+    VLMWaypointCandidate candidate;
+    candidate.source = source.source;
+    candidate.filtered = false;
+    candidate.filtered_reason.clear();
+    candidate.map_position = frontier;
+    candidate.safe_goal = frontier;
+    candidate.euclidean_distance = (frontier - cur_pos).norm();
+    candidate.frontier_size = source.frontier_size;
+    candidate.reachable = false;
+    candidate.recently_selected = false;
+    candidate.has_projection = false;
+    candidate.image_u = -1;
+    candidate.image_v = -1;
+    candidate.projected_depth = -1.0;
+    candidate.projection_type = "none";
+    candidate.projection_proxy = false;
+    candidate.projection_proxy_depth = -1.0;
+    candidate.path_length = std::numeric_limits<double>::max();
+    candidate.clearance = 0.0;
+    candidate.direction = directionLabel(cur_pos, cur_yaw, frontier);
+
+    if (candidate.euclidean_distance < ep_->vlm_min_candidate_distance_)
+      continue;
+
+    Vector2d frontier_goal;
+    vector<Vector2d> raw_path;
+    if (!searchFrontierPath(cur_pos, frontier, frontier_goal, raw_path))
+      continue;
+
+    Vector2d safe_goal;
+    vector<Vector2d> safe_path;
+    double clearance = 0.0;
+    if (!makeExecutableGoal(raw_path, safe_goal, safe_path, clearance))
+      continue;
+
+    candidate.euclidean_distance = (safe_goal - cur_pos).norm();
+    if (candidate.euclidean_distance < ep_->vlm_min_candidate_distance_)
+      continue;
+
+    candidate.reachable = true;
+    candidate.safe_goal = safe_goal;
+    candidate.path = safe_path;
+    candidate.path_length = Astar2D::pathLength(safe_path);
+    candidate.path_ratio = candidate.euclidean_distance > 1e-3
+        ? candidate.path_length / candidate.euclidean_distance
+        : std::numeric_limits<double>::max();
+    candidate.direction = directionLabel(cur_pos, cur_yaw, safe_goal);
+    candidate.clearance = clearance;
+    candidate.free_distance = -1.0;
+    candidate.valid = true;
+    candidate.reject_reason.clear();
+    ++vlm_last_candidate_count_before_clearance_filter_;
+    if (ep_->vlm_min_candidate_clearance_m_ > 0.0 &&
+        candidate.clearance >= 0.0 &&
+        candidate.clearance < ep_->vlm_min_candidate_clearance_m_) {
+      candidate.id = "C" + std::to_string(vlm_last_candidate_count_before_clearance_filter_);
+      candidate.filtered = true;
+      candidate.filtered_reason = "low_clearance";
+      vlm_last_low_clearance_filtered_candidates_.push_back(candidate);
+      ROS_WARN("[VLM Waypoint] Filter low-clearance candidate id=%s source=%s safe_goal=(%.2f, %.2f), clearance=%.2f m < %.2f m",
+          candidate.id.c_str(), candidate.source.c_str(), candidate.safe_goal(0),
+          candidate.safe_goal(1), candidate.clearance, ep_->vlm_min_candidate_clearance_m_);
+      continue;
+    }
+    if (candidate.clearance < 0.0) {
+      ROS_WARN("[VLM Waypoint] Candidate source=%s safe_goal=(%.2f, %.2f) has unavailable clearance %.2f; keeping candidate",
+          candidate.source.c_str(), candidate.safe_goal(0), candidate.safe_goal(1),
+          candidate.clearance);
+    }
+    ++vlm_last_candidate_count_after_clearance_filter_;
+
+	    ++vlm_last_candidate_count_before_path_ratio_filter_;
+	    if (!std::isfinite(candidate.path_ratio) ||
+	        candidate.path_ratio > ep_->vlm_max_candidate_path_ratio_) {
+	      if (trySlideFrontierCandidate(source, candidate)) {
+	        safe_goal = candidate.safe_goal;
+	        safe_path = candidate.path;
+	        clearance = candidate.clearance;
+	        ++vlm_last_candidate_count_after_path_ratio_filter_;
+	      }
+	      else {
+	        candidate.id = "C" + std::to_string(vlm_last_candidate_count_before_path_ratio_filter_);
+	        candidate.filtered = true;
+	        candidate.filtered_reason = "path_ratio_too_large";
+	        vlm_last_high_path_ratio_filtered_candidates_.push_back(candidate);
+	        ROS_WARN("[VLM Waypoint] Filter high-path-ratio candidate id=%s source=%s safe_goal=(%.2f, %.2f), distance=%.2f m, path_length=%.2f m, path_ratio=%.2f > %.2f",
+	            candidate.id.c_str(), candidate.source.c_str(), candidate.safe_goal(0),
+	            candidate.safe_goal(1), candidate.euclidean_distance, candidate.path_length,
+	            candidate.path_ratio, ep_->vlm_max_candidate_path_ratio_);
+	        continue;
+	      }
+	    }
+	    else {
+	      ++vlm_last_candidate_count_after_path_ratio_filter_;
+	    }
+
+    if (safeGoalDuplicated(safe_goal))
+      continue;
+    ++vlm_last_candidate_count_before_scan_reject_filter_;
+    if (isRejectedByVLMScan(safe_goal)) {
+      candidate.id = "C" + std::to_string(vlm_last_candidate_count_before_scan_reject_filter_);
+      candidate.filtered = true;
+      candidate.filtered_reason = "near_unselected_vlm_candidate";
+      vlm_last_scan_rejected_filtered_candidates_.push_back(candidate);
+      ROS_WARN("[VLM Scan] Filter candidate near previously unselected visible goal: id=%s safe_goal=(%.2f, %.2f), radius=%.2f",
+          candidate.id.c_str(), safe_goal(0), safe_goal(1),
+          ep_->vlm_scan_reject_candidate_radius_);
+      continue;
+    }
+    ++vlm_last_candidate_count_after_scan_reject_filter_;
+
+    candidate.recently_selected = isRecentlySelectedGoal(safe_goal);
+    {
+      bool projection_proxy = false;
+      double projection_proxy_depth = -1.0;
+      candidate.has_projection = projectCandidateToImageWithGroundProxy(cur_pos, cur_yaw,
+          safe_goal, image_width, image_height, candidate.image_u, candidate.image_v,
+          candidate.projected_depth, projection_proxy, projection_proxy_depth);
+      candidate.projection_proxy = projection_proxy;
+      candidate.projection_proxy_depth = projection_proxy_depth;
+	      candidate.projection_type = candidate.has_projection
+	          ? (projection_proxy ? "ground_ray_proxy" : "exact")
+	          : "none";
+	    }
+    if (!candidate.has_projection)
+      tryAddConnectorProxy(candidate);
+
+    if (candidate.euclidean_distance > ep_->vlm_max_candidate_distance_) {
+      long_range.push_back(candidate);
+      continue;
+    }
+
+    if (candidate.recently_selected)
+      recent.push_back(candidate);
+    else
+      preferred.push_back(candidate);
+  }
+
+  ROS_WARN("[VLM Scan] Unselected-candidate filter disabled; kept %d/%d candidate(s), removed=%zu",
+      vlm_last_candidate_count_after_scan_reject_filter_,
+      vlm_last_candidate_count_before_scan_reject_filter_,
+      vlm_last_scan_rejected_filtered_candidates_.size());
+  if (ep_->vlm_min_candidate_clearance_m_ > 0.0) {
+    ROS_WARN("[VLM Waypoint] Low-clearance filter kept %d/%d executable candidate(s), removed=%zu, min_candidate_clearance=%.2f m",
+        vlm_last_candidate_count_after_clearance_filter_,
+        vlm_last_candidate_count_before_clearance_filter_,
+        vlm_last_low_clearance_filtered_candidates_.size(),
+        ep_->vlm_min_candidate_clearance_m_);
+  } else {
+    ROS_WARN("[VLM Waypoint] Candidate clearance filter disabled; kept %d/%d executable candidate(s)",
+        vlm_last_candidate_count_after_clearance_filter_,
+        vlm_last_candidate_count_before_clearance_filter_);
+  }
+  ROS_WARN("[VLM Waypoint] Path-ratio filter kept %d/%d executable candidate(s), removed=%zu, max_candidate_path_ratio=%.2f",
+      vlm_last_candidate_count_after_path_ratio_filter_,
+      vlm_last_candidate_count_before_path_ratio_filter_,
+      vlm_last_high_path_ratio_filtered_candidates_.size(),
+      ep_->vlm_max_candidate_path_ratio_);
+
+  auto score = [](const VLMWaypointCandidate& c) {
+    return 0.03 * static_cast<double>(c.frontier_size) - 0.20 * c.path_length +
+        (c.has_projection ? 0.12 : 0.0);
+  };
+  auto better = [&](const VLMWaypointCandidate& a, const VLMWaypointCandidate& b) {
+    return score(a) > score(b);
+  };
+
+  std::sort(preferred.begin(), preferred.end(), better);
+  std::sort(recent.begin(), recent.end(), better);
+  std::sort(long_range.begin(), long_range.end(), better);
+
+  const double merge_dist = g_vlm_candidate_merge_distance;
+  const double pixel_merge_dist = std::max(40.0, 0.12 * std::min(image_width, image_height));
+  auto shouldMerge = [&](const VLMWaypointCandidate& a, const VLMWaypointCandidate& b) {
+    const double safe_goal_dist = (a.safe_goal - b.safe_goal).norm();
+    if (safe_goal_dist <= merge_dist)
+      return true;
+
+    if (a.direction != b.direction)
+      return false;
+
+    if (a.has_projection && b.has_projection) {
+      const double pixel_dist =
+          std::hypot(static_cast<double>(a.image_u - b.image_u),
+              static_cast<double>(a.image_v - b.image_v));
+      return pixel_dist <= pixel_merge_dist && safe_goal_dist <= 1.5 * merge_dist;
+    }
+
+    if (!a.has_projection && !b.has_projection)
+      return safe_goal_dist <= 1.5 * merge_dist;
+
+    return false;
+  };
+
+  auto mergeNearbyCandidates = [&](vector<VLMWaypointCandidate>& candidates) {
+    if (merge_dist <= 1e-3)
+      return;
+    if (candidates.size() < 2)
+      return;
+
+    vector<VLMWaypointCandidate> merged;
+    vector<bool> used(candidates.size(), false);
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      if (used[i])
+        continue;
+
+      vector<size_t> stack = { i };
+      used[i] = true;
+      VLMWaypointCandidate representative = candidates[i];
+      int max_frontier_size = representative.frontier_size;
+      while (!stack.empty()) {
+        const size_t idx = stack.back();
+        stack.pop_back();
+
+        const VLMWaypointCandidate& member = candidates[idx];
+        max_frontier_size = std::max(max_frontier_size, member.frontier_size);
+        if (better(member, representative))
+          representative = member;
+
+        for (size_t j = 0; j < candidates.size(); ++j) {
+          if (used[j])
+            continue;
+          if (shouldMerge(member, candidates[j])) {
+            used[j] = true;
+            stack.push_back(j);
+          }
+        }
+      }
+      representative.frontier_size = max_frontier_size;
+      merged.push_back(representative);
+    }
+
+    std::sort(merged.begin(), merged.end(), better);
+    candidates.swap(merged);
+  };
+
+  vector<VLMWaypointCandidate> pool = target_object_proxy;
+  pool.insert(pool.end(), preferred.begin(), preferred.end());
+  if (!connector_proxy.empty()) {
+    pool.insert(pool.end(), connector_proxy.begin(), connector_proxy.end());
+    ROS_WARN("[VLM Connector] Added %zu connector_proxy candidate(s) to main progress pool",
+        connector_proxy.size());
+  }
+  size_t unmerged_count = pool.size();
+  mergeNearbyCandidates(pool);
+  if ((int)pool.size() < ep_->vlm_min_candidates_) {
+    unmerged_count += recent.size();
+    pool.insert(pool.end(), recent.begin(), recent.end());
+  }
+  mergeNearbyCandidates(pool);
+	  if ((int)pool.size() < ep_->vlm_min_candidates_) {
+	    unmerged_count += long_range.size();
+	    pool.insert(pool.end(), long_range.begin(), long_range.end());
+	  }
+	  mergeNearbyCandidates(pool);
+  mergeNearbyCandidates(pool);
+
+	  ROS_WARN("[VLM Waypoint] Merge nearby candidates from %zu to %zu representative waypoint(s)",
+      unmerged_count, pool.size());
+
+  const vector<string> direction_order = { "front", "front-left", "front-right", "left", "right",
+    "back-left", "back-right", "back" };
+  vector<VLMWaypointCandidate> selected;
+  vector<bool> used(pool.size(), false);
+
+  for (const auto& direction : direction_order) {
+    int best_idx = -1;
+    double best_score = -std::numeric_limits<double>::max();
+    for (size_t i = 0; i < pool.size(); ++i) {
+      if (used[i] || pool[i].direction != direction)
+        continue;
+      const double s = score(pool[i]);
+      if (s > best_score) {
+        best_score = s;
+        best_idx = static_cast<int>(i);
+      }
+    }
+    if (best_idx >= 0) {
+      used[best_idx] = true;
+      selected.push_back(pool[best_idx]);
+      if ((int)selected.size() >= ep_->vlm_max_candidates_)
+        break;
+    }
+  }
+
+  for (size_t i = 0; i < pool.size() && (int)selected.size() < ep_->vlm_max_candidates_; ++i) {
+    if (!used[i])
+      selected.push_back(pool[i]);
+  }
+
+  std::sort(selected.begin(), selected.end(), [](const VLMWaypointCandidate& a,
+                                                  const VLMWaypointCandidate& b) {
+    return a.path_length < b.path_length;
+  });
+
+  for (size_t i = 0; i < selected.size(); ++i) {
+    selected[i].id = "F" + std::to_string(i + 1);
+    selected[i].label = selected[i].id;
+    selected[i].score = score(selected[i]);
+    selected[i].path_ratio = selected[i].euclidean_distance > 1e-3
+        ? selected[i].path_length / selected[i].euclidean_distance
+        : std::numeric_limits<double>::max();
+  }
+
+  vector<VLMWaypointCandidate> local_view_candidates =
+      buildLocalViewWaypointCandidates(cur_pos, cur_yaw, image_width, image_height);
+  selected.insert(selected.end(), local_view_candidates.begin(), local_view_candidates.end());
+
+  auto visibleCandidateCount = [](const vector<VLMWaypointCandidate>& candidates) {
+    return static_cast<int>(std::count_if(candidates.begin(), candidates.end(),
+        [](const VLMWaypointCandidate& candidate) {
+          return candidate.reachable && candidate.has_projection;
+        }));
+  };
+  if (ep_->vlm_recovery_candidates_enabled_ &&
+      visibleCandidateCount(selected) < ep_->vlm_min_candidates_) {
+    const int missing =
+        std::max(1, ep_->vlm_min_candidates_ - visibleCandidateCount(selected));
+    vector<VLMWaypointCandidate> recovery_candidates = buildRecoveryWaypointCandidates(
+        cur_pos, cur_yaw, image_width, image_height,
+        std::min(ep_->vlm_recovery_max_candidates_, missing + 2));
+    selected.insert(selected.end(), recovery_candidates.begin(), recovery_candidates.end());
+  }
+
+	  auto finalCandidateScore = [&](const VLMWaypointCandidate& c) {
+    double value = c.source == "local_view" ? c.score : score(c);
+    if (c.has_projection)
+      value += 0.15;
+    if (c.source == "local_view")
+      value += 0.02;
+    if (c.recently_selected)
+      value -= 0.35;
+    return value;
+  };
+
+  auto finalBetter = [&](const VLMWaypointCandidate& a, const VLMWaypointCandidate& b) {
+    const double score_a = finalCandidateScore(a);
+    const double score_b = finalCandidateScore(b);
+    if (std::fabs(score_a - score_b) > 1e-6)
+      return score_a > score_b;
+    return a.path_length < b.path_length;
+  };
+
+  auto finalShouldSuppress = [&](const VLMWaypointCandidate& kept,
+                                 const VLMWaypointCandidate& candidate) {
+    const double safe_goal_dist = (kept.safe_goal - candidate.safe_goal).norm();
+    const bool kept_local = kept.source == "local_view";
+    const bool candidate_local = candidate.source == "local_view";
+    if (kept_local != candidate_local)
+      return safe_goal_dist <= 0.20;
+
+    const double space_nms = kept_local && candidate_local
+        ? 0.28
+        : std::max(0.35, g_vlm_candidate_merge_distance);
+    if (safe_goal_dist <= space_nms)
+      return true;
+
+    if (!kept_local && !candidate_local && kept.direction == candidate.direction &&
+        safe_goal_dist <= std::max(0.75, 1.25 * space_nms))
+      return true;
+
+    if (!kept_local && !candidate_local &&
+        ep_->vlm_candidate_pixel_nms_ > 1e-3 &&
+        kept.has_projection && candidate.has_projection) {
+      const double pixel_dist =
+          std::hypot(static_cast<double>(kept.image_u - candidate.image_u),
+              static_cast<double>(kept.image_v - candidate.image_v));
+      if (pixel_dist <= ep_->vlm_candidate_pixel_nms_ &&
+          safe_goal_dist <= std::max(0.75, 1.5 * space_nms))
+        return true;
+    }
+
+    return false;
+  };
+
+  auto isEscapeCandidateSource = [](const string& source) {
+    return source == "recovery_proxy" ||
+           source == "backtrack_escape_proxy" ||
+           source == "micro_escape_proxy" ||
+           source == "emergency_escape_proxy";
+  };
+
+  auto maxEscapePerSource = [&](const string& source) {
+    if (source == "micro_escape_proxy")
+      return std::max(1, std::min(2, ep_->vlm_escape_max_per_source_ + 1));
+    return ep_->vlm_escape_max_per_source_;
+  };
+
+  auto compactEscapeCandidates = [&](const char* stage) {
+    if (!ep_->vlm_compact_escape_candidates_)
+      return;
+
+    const size_t before = selected.size();
+    std::stable_sort(selected.begin(), selected.end(), finalBetter);
+    vector<VLMWaypointCandidate> compacted;
+    compacted.reserve(selected.size());
+    for (const auto& candidate : selected) {
+      if (!isEscapeCandidateSource(candidate.source)) {
+        compacted.push_back(candidate);
+        continue;
+      }
+
+      int same_source_count = 0;
+      for (const auto& kept : compacted) {
+        if (kept.source == candidate.source)
+          same_source_count++;
+      }
+      if (same_source_count < maxEscapePerSource(candidate.source))
+        compacted.push_back(candidate);
+    }
+    if (compacted.empty() && !selected.empty())
+      compacted.push_back(selected.front());
+    if (compacted.size() < before) {
+      ROS_WARN("[VLM Recovery] Compact escape/recovery candidates at %s from %zu to %zu",
+          stage, before, compacted.size());
+    }
+    selected.swap(compacted);
+  };
+
+  const size_t pre_final_nms_count = selected.size();
+  std::stable_sort(selected.begin(), selected.end(), finalBetter);
+  vector<VLMWaypointCandidate> compact_selected;
+  compact_selected.reserve(selected.size());
+  for (const auto& candidate : selected) {
+    bool suppressed = false;
+    for (const auto& kept : compact_selected) {
+      if (finalShouldSuppress(kept, candidate)) {
+        suppressed = true;
+        break;
+      }
+    }
+    if (suppressed)
+      continue;
+    compact_selected.push_back(candidate);
+    if ((int)compact_selected.size() >= ep_->vlm_total_max_candidates_)
+      break;
+  }
+  selected.swap(compact_selected);
+  compactEscapeCandidates("post_final_nms");
+
+  if (ep_->vlm_recovery_candidates_enabled_ && visibleCandidateCount(selected) == 0) {
+    vector<VLMWaypointCandidate> recovery_candidates = buildRecoveryWaypointCandidates(
+        cur_pos, cur_yaw, image_width, image_height, ep_->vlm_recovery_max_candidates_);
+    for (const auto& candidate : recovery_candidates) {
+      if (static_cast<int>(selected.size()) >= ep_->vlm_total_max_candidates_)
+        break;
+      selected.push_back(candidate);
+    }
+  }
+  if (ep_->vlm_recovery_candidates_enabled_ && visibleCandidateCount(selected) == 0) {
+    VLMWaypointCandidate emergency_candidate;
+    if (buildEmergencyEscapeWaypointCandidate(
+            cur_pos, cur_yaw, image_width, image_height, emergency_candidate)) {
+      selected.push_back(emergency_candidate);
+      ROS_WARN("[VLM Recovery] Added emergency escape candidate after all regular "
+               "candidate sources returned no visible waypoint.");
+    }
+  }
+  compactEscapeCandidates("post_emergency_recovery");
+
+  std::sort(selected.begin(), selected.end(), [](const VLMWaypointCandidate& a,
+                                                  const VLMWaypointCandidate& b) {
+    return a.path_length < b.path_length;
+  });
+
+  size_t frontier_count = 0;
+  size_t local_view_count = 0;
+  for (auto& candidate : selected) {
+    if (candidate.source == "local_view") {
+      candidate.id = candidate.label.empty() ? candidate.id : candidate.label;
+      local_view_count++;
+    } else {
+      frontier_count++;
+      candidate.id = "F" + std::to_string(frontier_count);
+      candidate.label = candidate.id;
+      candidate.score = score(candidate);
+      candidate.path_ratio = candidate.euclidean_distance > 1e-3
+          ? candidate.path_length / candidate.euclidean_distance
+          : std::numeric_limits<double>::max();
+    }
+  }
+
+  if (visibleCandidateCount(selected) > 0) {
+    bool duplicate_open_view = false;
+    for (const auto& pose : vlm_recent_open_view_poses_) {
+      if ((pose - cur_pos).norm() < 0.25) {
+        duplicate_open_view = true;
+        break;
+      }
+    }
+    if (!duplicate_open_view) {
+      vlm_recent_open_view_poses_.push_back(cur_pos);
+      const size_t max_open_view_poses = 16;
+      if (vlm_recent_open_view_poses_.size() > max_open_view_poses)
+        vlm_recent_open_view_poses_.erase(vlm_recent_open_view_poses_.begin());
+    }
+  }
+
+  ROS_WARN("[VLM Waypoint] Final VLM candidates compacted from %zu to %zu "
+           "(frontier=%zu local_view=%zu, total_cap=%d, merge=%.2f m, pixel_nms=%.1f px)",
+      pre_final_nms_count, selected.size(), frontier_count, local_view_count,
+      ep_->vlm_total_max_candidates_, g_vlm_candidate_merge_distance,
+      ep_->vlm_candidate_pixel_nms_);
+
+  return selected;
+}
+
+bool ExplorationManager::buildEmergencyEscapeWaypointCandidate(const Vector2d& cur_pos,
+    double cur_yaw, int image_width, int image_height, VLMWaypointCandidate& candidate)
+{
+  if (!ep_->vlm_recovery_candidates_enabled_ || !sdf_map_ ||
+      image_width <= 0 || image_height <= 0)
+    return false;
+
+  Eigen::Vector2d map_min, map_max;
+  sdf_map_->getMapBoundary(map_min, map_max);
+  const double min_dist = std::max(0.22, 0.5 * ep_->vlm_recovery_min_distance_);
+  const double max_dist = std::max(1.20, ep_->vlm_recovery_max_distance_);
+
+  auto normalizeDeg = [](double deg) {
+    while (deg > 180.0) deg -= 360.0;
+    while (deg <= -180.0) deg += 360.0;
+    return deg;
+  };
+
+  auto clamp01 = [](double value) {
+    return std::min(1.0, std::max(0.0, value));
+  };
+
+  auto inLooseMap = [&](const Vector2d& point) {
+    if (!sdf_map_->isInMap(point))
+      return false;
+    return point(0) >= map_min(0) + 0.03 && point(1) >= map_min(1) + 0.03 &&
+           point(0) <= map_max(0) - 0.03 && point(1) <= map_max(1) - 0.03;
+  };
+
+  auto lineHasNoHardObstacle = [&](const Vector2d& goal) {
+    const double distance = (goal - cur_pos).norm();
+    if (distance < 1e-3)
+      return false;
+    const int steps = std::max(3, static_cast<int>(std::ceil(distance / 0.08)));
+    for (int i = 1; i <= steps; ++i) {
+      const double t = static_cast<double>(i) / static_cast<double>(steps);
+      const Vector2d point = cur_pos + t * (goal - cur_pos);
+      if (!inLooseMap(point))
+        return false;
+      if (sdf_map_->getOccupancy(point) == SDFMap2D::OCCUPIED)
+        return false;
+    }
+    return true;
+  };
+
+  auto projectEmergencyMarker = [&](const Vector2d& goal, int& image_u, int& image_v,
+                                    double& projected_depth,
+                                    double& projection_proxy_depth,
+                                    string& projection_type) {
+    const double rel_yaw = std::atan2(goal(1) - cur_pos(1), goal(0) - cur_pos(0)) - cur_yaw;
+    const double deg = normalizeDeg(rel_yaw * 180.0 / M_PI);
+    const int margin_x = std::max(12, static_cast<int>(std::round(0.05 * image_width)));
+    const int margin_y = std::max(14, static_cast<int>(std::round(0.06 * image_height)));
+    if (std::fabs(deg) <= 115.0) {
+      const double normalized = std::max(-1.0, std::min(1.0, deg / 115.0));
+      image_u = static_cast<int>(std::round(image_width * 0.5 -
+          normalized * image_width * 0.43));
+      image_u = std::min(image_width - 1 - margin_x, std::max(margin_x, image_u));
+    }
+    else if (std::fabs(deg) >= 150.0) {
+      image_u = image_width / 2;
+    }
+    else {
+      image_u = deg > 0.0 ? margin_x : image_width - 1 - margin_x;
+    }
+    image_v = image_height - 1 - margin_y;
+    projected_depth = (goal - cur_pos).norm();
+    projection_proxy_depth = projected_depth;
+    projection_type = "emergency_escape_proxy";
+    return true;
+  };
+
+  VLMWaypointCandidate best_candidate;
+  double best_score = -std::numeric_limits<double>::infinity();
+  bool have_best = false;
+
+  auto considerGoal = [&](const Vector2d& raw_goal, const string& source_name,
+                          double source_bonus) {
+    if (!inLooseMap(raw_goal))
+      return;
+    if (sdf_map_->getOccupancy(raw_goal) == SDFMap2D::OCCUPIED)
+      return;
+    const double euclidean = (raw_goal - cur_pos).norm();
+    if (euclidean < min_dist || euclidean > max_dist)
+      return;
+    if (!lineHasNoHardObstacle(raw_goal))
+      return;
+    if (isRejectedByVLMScan(raw_goal))
+      return;
+
+    vector<Vector2d> path;
+    if (path_finder_) {
+      path_finder_->reset();
+      int search_result = path_finder_->astarSearch(cur_pos, raw_goal, 0.15,
+          std::max(0.35, ep_->vlm_local_view_astar_max_time_),
+          Astar2D::SAFETY_MODE::NORMAL);
+      if (search_result != Astar2D::REACH_END) {
+        path_finder_->reset();
+        search_result = path_finder_->astarSearch(cur_pos, raw_goal, 0.15,
+            std::max(0.35, ep_->vlm_local_view_astar_max_time_),
+            Astar2D::SAFETY_MODE::OPTIMISTIC);
+      }
+      if (search_result == Astar2D::REACH_END)
+        path = path_finder_->getPath();
+    }
+    if (path.empty())
+      path = { cur_pos, raw_goal };
+
+    double path_length = std::max(Astar2D::pathLength(path), 1.05 * euclidean);
+    const double path_ratio =
+        euclidean > 1e-3 ? path_length / euclidean : std::numeric_limits<double>::max();
+    if (!std::isfinite(path_ratio) || path_ratio > std::max(8.0, ep_->vlm_recovery_path_ratio_max_))
+      return;
+
+    int image_u = -1;
+    int image_v = -1;
+    double projected_depth = -1.0;
+    bool projection_proxy = false;
+    double projection_proxy_depth = -1.0;
+    string projection_type = "none";
+    bool projected = projectCandidateToImageWithGroundProxy(cur_pos, cur_yaw, raw_goal,
+        image_width, image_height, image_u, image_v, projected_depth, projection_proxy,
+        projection_proxy_depth);
+    if (projected) {
+      projection_type = projection_proxy ? "ground_ray_proxy" : "exact";
+    }
+    else if (projectCandidateToImageWithEdgeProxy(cur_pos, cur_yaw, raw_goal,
+                 image_width, image_height, image_u, image_v, projected_depth,
+                 projection_proxy_depth)) {
+      projected = true;
+      projection_proxy = true;
+      projection_type = "edge_proxy";
+    }
+    else {
+      projected = projectEmergencyMarker(raw_goal, image_u, image_v, projected_depth,
+          projection_proxy_depth, projection_type);
+      projection_proxy = projected;
+    }
+    if (!projected)
+      return;
+
+    double clearance = sdf_map_->getDistance(raw_goal);
+    if (!std::isfinite(clearance))
+      clearance = -1.0;
+    const double rel_deg = normalizeDeg(
+        (std::atan2(raw_goal(1) - cur_pos(1), raw_goal(0) - cur_pos(0)) - cur_yaw) *
+        180.0 / M_PI);
+    const double clearance_score =
+        clearance >= 0.0 ? clamp01(clearance / 0.20) : 0.25;
+    const double distance_score =
+        clamp01(1.0 - std::fabs(euclidean - 0.65) / std::max(1.0, max_dist));
+    const double heading_score = clamp01(1.0 - std::fabs(rel_deg) / 180.0);
+    const double projection_score = projection_type == "exact" ? 1.0 :
+        (projection_type == "ground_ray_proxy" ? 0.78 :
+            (projection_type == "edge_proxy" ? 0.55 : 0.35));
+    const double score = source_bonus + 0.28 * clearance_score +
+        0.28 * distance_score + 0.24 * heading_score + 0.20 * projection_score;
+    if (score <= best_score)
+      return;
+
+    VLMWaypointCandidate emergency;
+    emergency.id = "EC1";
+    emergency.label = emergency.id;
+    emergency.source = source_name;
+    emergency.filtered = false;
+    emergency.filtered_reason.clear();
+    emergency.map_position = raw_goal;
+    emergency.safe_goal = raw_goal;
+    emergency.theta_deg = rel_deg;
+    emergency.euclidean_distance = euclidean;
+    emergency.path_length = path_length;
+    emergency.path_ratio = path_ratio;
+    emergency.clearance = clearance;
+    emergency.score = score;
+    emergency.free_distance = euclidean;
+    emergency.sampled_ray_count = static_cast<int>(path.size());
+    emergency.valid = true;
+    emergency.reject_reason.clear();
+    emergency.direction = directionLabel(cur_pos, cur_yaw, raw_goal);
+    emergency.reachable = true;
+    emergency.frontier_size = 1;
+    emergency.recently_selected = isRecentlySelectedGoal(raw_goal);
+    emergency.has_projection = true;
+    emergency.image_u = image_u;
+    emergency.image_v = image_v;
+    emergency.projected_depth = projected_depth;
+    emergency.projection_type = projection_type;
+    emergency.projection_proxy = projection_proxy;
+    emergency.projection_proxy_depth = projection_proxy_depth;
+    emergency.path = path;
+
+    best_candidate = emergency;
+    best_score = score;
+    have_best = true;
+  };
+
+  const vector<double> theta_degs = {
+    0.0, -20.0, 20.0, -40.0, 40.0, -65.0, 65.0,
+    -90.0, 90.0, -135.0, 135.0, 180.0
+  };
+  const vector<double> distances = {
+    0.30, 0.45, 0.65, 0.90, 1.15, max_dist
+  };
+  for (const double theta_deg : theta_degs) {
+    for (const double distance : distances) {
+      const double local_distance = std::min(max_dist, std::max(min_dist, distance));
+      const double yaw = cur_yaw + theta_deg * M_PI / 180.0;
+      const Vector2d goal(cur_pos(0) + local_distance * std::cos(yaw),
+          cur_pos(1) + local_distance * std::sin(yaw));
+      const double source_bonus = std::fabs(theta_deg) <= 65.0 ? 0.05 : 0.0;
+      considerGoal(goal, "emergency_escape_proxy", source_bonus);
+    }
+  }
+
+  if (!have_best)
+    return false;
+
+  candidate = best_candidate;
+  ROS_WARN("[VLM Recovery] Emergency escape candidate source=%s goal=(%.2f, %.2f) "
+           "dist=%.2f path=%.2f clearance=%.2f projection=%s",
+      candidate.source.c_str(), candidate.safe_goal(0), candidate.safe_goal(1),
+      candidate.euclidean_distance, candidate.path_length, candidate.clearance,
+      candidate.projection_type.c_str());
+  return true;
+}
+
+string ExplorationManager::makeVLMRequestId()
+{
+  ++vlm_request_counter_;
+  std::ostringstream oss;
+  oss << "epi" << episode_index_ << "_step" << vlm_request_counter_ << "_"
+      << jsonEscape(target_label_) << "_vlm_guided_geometric";
+  string id = oss.str();
+  for (auto& ch : id) {
+    if (!(std::isalnum(ch) || ch == '_' || ch == '-'))
+      ch = '_';
+  }
+  return id;
+}
+
+string ExplorationManager::shellQuote(const string& value) const
+{
+  string quoted = "'";
+  for (const char c : value) {
+    if (c == '\'')
+      quoted += "'\\''";
+    else
+      quoted += c;
+  }
+  quoted += "'";
+  return quoted;
+}
+
+string ExplorationManager::jsonEscape(const string& value) const
+{
+  std::ostringstream oss;
+  for (const char c : value) {
+    switch (c) {
+      case '\\': oss << "\\\\"; break;
+      case '"': oss << "\\\""; break;
+      case '\n': oss << "\\n"; break;
+      case '\r': oss << "\\r"; break;
+      case '\t': oss << "\\t"; break;
+      default: oss << c; break;
+    }
+  }
+  return oss.str();
+}
+
+void ExplorationManager::writeVLMDetectorSemanticMapSnapshot(
+    std::ostream& out, const Vector2d& cur_pos, double cur_yaw) const
+{
+  vector<ObjectClusterSummary> objects;
+  if (object_map2d_)
+    object_map2d_->getObjectSummaries(objects);
+
+  int all_object_points = 0;
+  int over_depth_points = 0;
+  if (object_map2d_ && object_map2d_->all_object_clouds_)
+    all_object_points = static_cast<int>(object_map2d_->all_object_clouds_->points.size());
+  if (object_map2d_ && object_map2d_->over_depth_object_cloud_)
+    over_depth_points =
+        static_cast<int>(object_map2d_->over_depth_object_cloud_->points.size());
+
+  auto normalizeDeg = [](double deg) {
+    while (deg > 180.0) deg -= 360.0;
+    while (deg <= -180.0) deg += 360.0;
+    return deg;
+  };
+
+  out << "  \"detector_semantic_map\": {\n";
+  out << "    \"source\": \"ObjectMap2D_fused_from_detector_clouds\",\n";
+  out << "    \"target_label\": \"" << jsonEscape(target_label_) << "\",\n";
+  out << "    \"label_zero_hint\": \"target:" << jsonEscape(target_label_) << "\",\n";
+  out << "    \"object_count\": " << objects.size() << ",\n";
+  out << "    \"all_object_cloud_points\": " << all_object_points << ",\n";
+  out << "    \"over_depth_target_points\": " << over_depth_points << ",\n";
+  out << "    \"objects\": [\n";
+  for (size_t i = 0; i < objects.size(); ++i) {
+    const auto& object = objects[i];
+    const Vector2d delta = object.center - cur_pos;
+    const double distance = delta.norm();
+    const double theta_deg =
+        normalizeDeg((std::atan2(delta(1), delta(0)) - cur_yaw) * 180.0 / M_PI);
+    const string label_hint = object.best_label == 0
+        ? string("target:") + target_label_
+        : string("class_") + std::to_string(object.best_label);
+
+    out << "      {\"id\": " << object.id
+        << ", \"label_index\": " << object.best_label
+        << ", \"label_hint\": \"" << jsonEscape(label_hint)
+        << "\", \"center\": [" << object.center(0) << ", " << object.center(1)
+        << "], \"relative_theta_deg\": " << theta_deg
+        << ", \"distance\": " << distance
+        << ", \"best_score\": " << object.best_score
+        << ", \"target_score\": " << object.target_score
+        << ", \"best_observation_count\": " << object.best_observation_count
+        << ", \"target_observation_count\": " << object.target_observation_count
+        << ", \"cell_count\": " << object.cell_count
+        << ", \"good_cell_count\": " << object.good_cell_count
+        << ", \"bbox2d_min\": [" << object.box_min2d(0) << ", " << object.box_min2d(1)
+        << "], \"bbox2d_max\": [" << object.box_max2d(0) << ", " << object.box_max2d(1)
+        << "], \"bbox3d_min\": [" << object.box_min3d(0) << ", " << object.box_min3d(1)
+        << ", " << object.box_min3d(2)
+        << "], \"bbox3d_max\": [" << object.box_max3d(0) << ", " << object.box_max3d(1)
+        << ", " << object.box_max3d(2) << "]}";
+    if (i + 1 < objects.size())
+      out << ",";
+    out << "\n";
+  }
+  out << "    ]\n";
+  out << "  },\n";
+}
+
+void ExplorationManager::writeVLMMetricMapSummary(std::ostream& out) const
+{
+  if (!sdf_map_) {
+    out << "  \"metric_map_summary\": {\"available\": false, "
+        << "\"reason\": \"sdf_map_missing\"},\n";
+    return;
+  }
+
+  const int voxel_count = std::max(0, sdf_map_->getVoxelNum());
+  const double resolution = sdf_map_->getResolution();
+  const double cell_area = resolution * resolution;
+  int unknown_count = 0;
+  int free_count = 0;
+  int occupied_count = 0;
+  int inflated_occupied_count = 0;
+  vector<Eigen::Vector2i> free_cells;
+  vector<Eigen::Vector2i> occupied_cells;
+
+  for (int adr = 0; adr < voxel_count; ++adr) {
+    const Eigen::Vector2i idx = sdf_map_->addressToIdx(adr);
+    const int occ = sdf_map_->getOccupancy(idx);
+    if (occ == SDFMap2D::UNKNOWN)
+      ++unknown_count;
+    else if (occ == SDFMap2D::OCCUPIED) {
+      ++occupied_count;
+      occupied_cells.push_back(idx);
+    }
+    else if (occ == SDFMap2D::FREE) {
+      ++free_count;
+      free_cells.push_back(idx);
+    }
+    if (sdf_map_->getInflateOccupancy(idx) == 1)
+      ++inflated_occupied_count;
+  }
+
+  Eigen::Vector2d map_min(0.0, 0.0), map_max(0.0, 0.0);
+  Eigen::Vector2d local_min(0.0, 0.0), local_max(0.0, 0.0);
+  sdf_map_->getMapBoundary(map_min, map_max);
+  sdf_map_->getLocalUpdatedBox(local_min, local_max);
+
+  vector<vector<Vector2d>> active_frontier_clusters, dormant_frontier_clusters;
+  vector<Vector2d> active_frontier_averages, dormant_frontier_averages;
+  if (frontier_map2d_) {
+    frontier_map2d_->getFrontiers(active_frontier_clusters, active_frontier_averages);
+    frontier_map2d_->getDormantFrontiers(dormant_frontier_clusters, dormant_frontier_averages);
+  }
+  int active_frontier_cells = 0;
+  for (const auto& cluster : active_frontier_clusters)
+    active_frontier_cells += static_cast<int>(cluster.size());
+  int dormant_frontier_cells = 0;
+  for (const auto& cluster : dormant_frontier_clusters)
+    dormant_frontier_cells += static_cast<int>(cluster.size());
+
+  const int known_count = free_count + occupied_count;
+  const double explored_ratio =
+      voxel_count > 0 ? static_cast<double>(known_count) / static_cast<double>(voxel_count) : 0.0;
+
+  out << "  \"metric_map_summary\": {\n";
+  out << "    \"available\": true,\n";
+  out << "    \"source\": \"SDFMap2D_occupancy_grid\",\n";
+  out << "    \"resolution_m\": " << resolution << ",\n";
+  out << "    \"voxel_count\": " << voxel_count << ",\n";
+  out << "    \"map_boundary\": {\"min\": [" << map_min(0) << ", " << map_min(1)
+      << "], \"max\": [" << map_max(0) << ", " << map_max(1) << "]},\n";
+  out << "    \"local_update_box\": {\"min\": [" << local_min(0) << ", " << local_min(1)
+      << "], \"max\": [" << local_max(0) << ", " << local_max(1) << "]},\n";
+  out << "    \"occupancy_grid\": {\"encoding\": \"grid_indices\", \"origin\": ["
+      << map_min(0) << ", " << map_min(1) << "], \"resolution_m\": " << resolution
+      << ", \"free\": [";
+  for (size_t i = 0; i < free_cells.size(); ++i) {
+    out << "[" << free_cells[i](0) << ", " << free_cells[i](1) << "]";
+    if (i + 1 < free_cells.size())
+      out << ",";
+  }
+  out << "], \"occupied\": [";
+  for (size_t i = 0; i < occupied_cells.size(); ++i) {
+    out << "[" << occupied_cells[i](0) << ", " << occupied_cells[i](1) << "]";
+    if (i + 1 < occupied_cells.size())
+      out << ",";
+  }
+  out << "]},\n";
+  out << "    \"cell_counts\": {\"unknown\": " << unknown_count
+      << ", \"free\": " << free_count
+      << ", \"occupied\": " << occupied_count
+      << ", \"known\": " << known_count
+      << ", \"inflated_occupied\": " << inflated_occupied_count << "},\n";
+  out << "    \"area_m2\": {\"unknown\": " << unknown_count * cell_area
+      << ", \"free\": " << free_count * cell_area
+      << ", \"occupied\": " << occupied_count * cell_area
+      << ", \"known\": " << known_count * cell_area
+      << ", \"inflated_occupied\": " << inflated_occupied_count * cell_area << "},\n";
+  out << "    \"explored_ratio\": " << explored_ratio << ",\n";
+  out << "    \"frontiers\": {\"active_count\": " << active_frontier_clusters.size()
+      << ", \"active_cell_count\": " << active_frontier_cells
+      << ", \"dormant_count\": " << dormant_frontier_clusters.size()
+      << ", \"dormant_cell_count\": " << dormant_frontier_cells << "}\n";
+  out << "  },\n";
+}
+
+bool ExplorationManager::saveLatestRGBImage(const string& image_path, string& error_msg)
+{
+  if (!have_latest_rgb_ || latest_rgb_image_.empty()) {
+    error_msg = "no_latest_rgb_image";
+    return false;
+  }
+  if (!cv::imwrite(image_path, latest_rgb_image_)) {
+    error_msg = "cv_imwrite_failed";
+    return false;
+  }
+  return true;
+}
+
+bool ExplorationManager::saveLatestDepthImage(const string& image_path, string& error_msg)
+{
+  if (!have_latest_depth_ || latest_depth_viz_image_.empty()) {
+    error_msg = "no_latest_depth_image";
+    return false;
+  }
+  if (!cv::imwrite(image_path, latest_depth_viz_image_)) {
+    error_msg = "depth_cv_imwrite_failed";
+    return false;
+  }
+  return true;
+}
+
+bool ExplorationManager::projectCandidateToImage(const Vector2d& cur_pos, double cur_yaw,
+    const Vector2d& goal, int image_width, int image_height, int& u, int& v,
+    double& forward_depth) const
+{
+  const double dx = goal(0) - cur_pos(0);
+  const double dy = goal(1) - cur_pos(1);
+  const double cos_yaw = std::cos(cur_yaw);
+  const double sin_yaw = std::sin(cur_yaw);
+  const double forward = cos_yaw * dx + sin_yaw * dy;
+  const double left = -sin_yaw * dx + cos_yaw * dy;
+  const double right = -left;
+
+  forward_depth = forward;
+  if (forward <= 0.20 || image_width <= 0 || image_height <= 0)
+    return false;
+
+  const double pixel_x = ep_->vlm_camera_cx_ + ep_->vlm_camera_fx_ * right / forward;
+  const double pixel_y = ep_->vlm_camera_cy_ + ep_->vlm_camera_fy_ * ep_->vlm_camera_height_ / forward;
+  u = static_cast<int>(std::round(pixel_x));
+  v = static_cast<int>(std::round(pixel_y));
+
+  return u >= 0 && u < image_width && v >= 0 && v < image_height;
+}
+
+bool ExplorationManager::projectCandidateToImageWithGroundProxy(const Vector2d& cur_pos,
+    double cur_yaw, const Vector2d& goal, int image_width, int image_height, int& u,
+    int& v, double& forward_depth, bool& used_proxy, double& proxy_forward_depth) const
+{
+  u = -1;
+  v = -1;
+  forward_depth = -1.0;
+  used_proxy = false;
+  proxy_forward_depth = -1.0;
+
+  if (image_width <= 0 || image_height <= 0 || ep_->vlm_camera_fx_ <= 1e-6 ||
+      ep_->vlm_camera_fy_ <= 1e-6 || ep_->vlm_camera_height_ <= 1e-6)
+    return false;
+
+  const double dx = goal(0) - cur_pos(0);
+  const double dy = goal(1) - cur_pos(1);
+  const double cos_yaw = std::cos(cur_yaw);
+  const double sin_yaw = std::sin(cur_yaw);
+  const double forward = cos_yaw * dx + sin_yaw * dy;
+  const double left = -sin_yaw * dx + cos_yaw * dy;
+  const double right = -left;
+
+  forward_depth = forward;
+  if (forward <= 0.20)
+    return false;
+
+  const double right_over_forward = right / forward;
+  const double pixel_x = ep_->vlm_camera_cx_ + ep_->vlm_camera_fx_ * right_over_forward;
+  const double pixel_y = ep_->vlm_camera_cy_ +
+      ep_->vlm_camera_fy_ * ep_->vlm_camera_height_ / forward;
+
+  if (!std::isfinite(pixel_x) || !std::isfinite(pixel_y))
+    return false;
+
+  // Horizontal FOV is strict: candidates outside the current RGB view are not drawable.
+  if (pixel_x < 0.0 || pixel_x >= static_cast<double>(image_width))
+    return false;
+
+  auto assignPixel = [&](double px, double py) {
+    const int rounded_x = static_cast<int>(std::round(px));
+    const int rounded_y = static_cast<int>(std::round(py));
+    u = std::min(std::max(rounded_x, 0), image_width - 1);
+    v = std::min(std::max(rounded_y, 0), image_height - 1);
+  };
+
+  if (pixel_y >= 0.0 && pixel_y < static_cast<double>(image_height)) {
+    assignPixel(pixel_x, pixel_y);
+    proxy_forward_depth = forward;
+    return true;
+  }
+
+  // For near ground goals that fall below the image, draw the nearest visible ground
+  // point on the same bearing. Execution still uses the real safe_goal.
+  if (pixel_y < 0.0)
+    return false;
+
+  const double marker_margin = std::min(24.0,
+      std::max(2.0, 0.05 * static_cast<double>(image_height)));
+  const double target_y = std::max(1.0,
+      static_cast<double>(image_height) - 1.0 - marker_margin);
+  const double denom = target_y - ep_->vlm_camera_cy_;
+  if (denom <= 1e-6)
+    return false;
+
+  const double proxy_forward =
+      ep_->vlm_camera_fy_ * ep_->vlm_camera_height_ / denom;
+  if (!std::isfinite(proxy_forward) || proxy_forward <= 0.20)
+    return false;
+
+  const double proxy_pixel_x = ep_->vlm_camera_cx_ +
+      ep_->vlm_camera_fx_ * right_over_forward;
+  if (!std::isfinite(proxy_pixel_x) || proxy_pixel_x < 0.0 ||
+      proxy_pixel_x >= static_cast<double>(image_width))
+    return false;
+
+  assignPixel(proxy_pixel_x, target_y);
+  used_proxy = true;
+  proxy_forward_depth = proxy_forward;
+  return true;
+}
+
+bool ExplorationManager::projectCandidateToImageWithEdgeProxy(const Vector2d& cur_pos,
+    double cur_yaw, const Vector2d& goal, int image_width, int image_height, int& u,
+    int& v, double& forward_depth, double& proxy_forward_depth) const
+{
+  u = -1;
+  v = -1;
+  forward_depth = -1.0;
+  proxy_forward_depth = -1.0;
+
+  if (image_width <= 0 || image_height <= 0)
+    return false;
+
+  const double dx = goal(0) - cur_pos(0);
+  const double dy = goal(1) - cur_pos(1);
+  const double cos_yaw = std::cos(cur_yaw);
+  const double sin_yaw = std::sin(cur_yaw);
+  const double forward = cos_yaw * dx + sin_yaw * dy;
+  const double left = -sin_yaw * dx + cos_yaw * dy;
+  const double right = -left;
+  forward_depth = forward;
+  if (forward <= 0.20)
+    return false;
+
+  const double bearing_deg = std::atan2(left, forward) * 180.0 / M_PI;
+  if (std::fabs(bearing_deg) > 85.0)
+    return false;
+
+  const int margin_x = std::max(10, static_cast<int>(std::round(0.045 * image_width)));
+  const int margin_y = std::max(12, static_cast<int>(std::round(0.055 * image_height)));
+  const int center_x = image_width / 2;
+  if (std::fabs(bearing_deg) <= 0.5) {
+    u = center_x;
+  }
+  else if (right > 0.0) {
+    u = image_width - 1 - margin_x;
+  }
+  else {
+    u = margin_x;
+  }
+  v = image_height - 1 - margin_y;
+  proxy_forward_depth = forward;
+  return true;
+}
+
+double ExplorationManager::estimateLocalViewRayFreeDistance(
+    double theta_deg, int& sampled_pixel_count, int& image_u) const
+{
+  sampled_pixel_count = 0;
+  image_u = -1;
+  if (!have_latest_depth_meters_ || latest_depth_meters_.empty() || latest_depth_meters_.type() != CV_32FC1)
+    return -1.0;
+
+  const int width = latest_depth_meters_.cols;
+  const int height = latest_depth_meters_.rows;
+  if (width <= 0 || height <= 0 || ep_->vlm_local_view_hfov_deg_ <= 1e-3)
+    return -1.0;
+
+  const double half_hfov = 0.5 * ep_->vlm_local_view_hfov_deg_;
+  if (theta_deg < -half_hfov || theta_deg > half_hfov)
+    return -1.0;
+
+  const double x_float = (0.5 - theta_deg / ep_->vlm_local_view_hfov_deg_) *
+      static_cast<double>(width - 1);
+  image_u = static_cast<int>(std::round(x_float));
+  if (image_u < 0 || image_u >= width)
+    return -1.0;
+
+  const int half_window = std::max(0, ep_->vlm_local_view_pixel_window_ / 2);
+  const int x0 = std::max(0, image_u - half_window);
+  const int x1 = std::min(width - 1, image_u + half_window);
+  const int y0 = std::max(0,
+      static_cast<int>(std::floor(ep_->vlm_local_view_depth_row_min_ratio_ * height)));
+  const int y1 = std::min(height - 1,
+      static_cast<int>(std::ceil(ep_->vlm_local_view_depth_row_max_ratio_ * height)) - 1);
+  if (y1 < y0)
+    return -1.0;
+
+  vector<float> values;
+  values.reserve((x1 - x0 + 1) * ((y1 - y0) / 2 + 1));
+  for (int y = y0; y <= y1; y += 2) {
+    const float* row_ptr = latest_depth_meters_.ptr<float>(y);
+    for (int x = x0; x <= x1; ++x) {
+      const float depth = row_ptr[x];
+      if (!std::isfinite(depth))
+        continue;
+      if (depth <= ep_->vlm_local_view_depth_min_m_ + 1e-3)
+        continue;
+      if (depth > ep_->vlm_local_view_max_depth_m_ + 1e-3)
+        continue;
+      values.push_back(depth);
+    }
+  }
+
+  sampled_pixel_count = static_cast<int>(values.size());
+  if (values.size() < 3)
+    return -1.0;
+
+  const size_t percentile_index = std::min(values.size() - 1,
+      static_cast<size_t>(std::floor(0.20 * static_cast<double>(values.size() - 1))));
+  std::nth_element(values.begin(), values.begin() + percentile_index, values.end());
+  return static_cast<double>(values[percentile_index]);
+}
+
+vector<VLMWaypointCandidate> ExplorationManager::buildLocalViewWaypointCandidates(
+    const Vector2d& cur_pos, double cur_yaw, int image_width, int image_height)
+{
+  vector<VLMWaypointCandidate> local_candidates;
+  vlm_last_local_view_rejected_candidates_.clear();
+
+  auto makeRejected = [&](const string& label, double theta_deg, double distance,
+                          const string& reason, double free_distance,
+                          int sampled_ray_count) {
+    VLMWaypointCandidate rejected;
+    rejected.id = label;
+    rejected.label = label;
+    rejected.source = "local_view";
+    rejected.valid = false;
+    rejected.reject_reason = reason;
+    rejected.filtered = true;
+    rejected.filtered_reason = reason;
+    rejected.map_position = cur_pos;
+    rejected.safe_goal = cur_pos;
+    rejected.theta_deg = theta_deg;
+    rejected.euclidean_distance = distance;
+    rejected.path_length = 0.0;
+    rejected.path_ratio = 0.0;
+    rejected.clearance = -1.0;
+    rejected.score = 0.0;
+    rejected.free_distance = free_distance;
+    rejected.sampled_ray_count = sampled_ray_count;
+    rejected.direction = "local_view";
+    rejected.reachable = false;
+    rejected.frontier_size = 0;
+    rejected.recently_selected = false;
+    rejected.has_projection = false;
+    rejected.image_u = -1;
+    rejected.image_v = -1;
+    rejected.projected_depth = -1.0;
+    vlm_last_local_view_rejected_candidates_.push_back(rejected);
+  };
+
+  if (!ep_->vlm_use_local_view_candidates_) {
+    ROS_WARN_THROTTLE(2.0, "[VLM LocalView] Local reachable candidates disabled");
+    return local_candidates;
+  }
+  if (!have_latest_depth_meters_ || latest_depth_meters_.empty()) {
+    ROS_WARN_THROTTLE(2.0, "[VLM LocalView] Skip local candidates: no metric depth image");
+    return local_candidates;
+  }
+
+  struct LocalSector {
+    string label;
+    double min_deg;
+    double max_deg;
+  };
+  const vector<LocalSector> sectors = {
+    {"LF", ep_->vlm_local_view_sector_left_front_min_deg_, ep_->vlm_local_view_sector_left_front_max_deg_},
+    {"F", ep_->vlm_local_view_sector_front_min_deg_, ep_->vlm_local_view_sector_front_max_deg_},
+    {"RF", ep_->vlm_local_view_sector_right_front_min_deg_, ep_->vlm_local_view_sector_right_front_max_deg_},
+  };
+
+  Eigen::Vector2d map_min, map_max;
+  sdf_map_->getMapBoundary(map_min, map_max);
+
+  auto clamp01 = [](double value) {
+    return std::min(1.0, std::max(0.0, value));
+  };
+
+  for (const auto& sector : sectors) {
+    const int ray_count = std::max(1, ep_->vlm_local_view_rays_per_sector_);
+    const double sector_center = 0.5 * (sector.min_deg + sector.max_deg);
+    const double sector_half_width = std::max(1e-3, 0.5 * std::fabs(sector.max_deg - sector.min_deg));
+    vector<VLMWaypointCandidate> sector_candidates;
+    const int max_sector_candidates = std::max(1, ep_->vlm_local_view_max_per_sector_);
+    int valid_depth_rays = 0;
+    int generated_candidates = 0;
+
+    auto addSectorCandidate = [&](VLMWaypointCandidate candidate) {
+      for (const auto& kept : sector_candidates) {
+        const double goal_dist = (kept.safe_goal - candidate.safe_goal).norm();
+        const double pixel_dist = kept.has_projection && candidate.has_projection
+            ? std::hypot(static_cast<double>(kept.image_u - candidate.image_u),
+                  static_cast<double>(kept.image_v - candidate.image_v))
+            : std::numeric_limits<double>::infinity();
+        if (goal_dist < 0.22 || pixel_dist < 26.0)
+          return;
+      }
+      sector_candidates.push_back(candidate);
+      std::sort(sector_candidates.begin(), sector_candidates.end(),
+          [](const VLMWaypointCandidate& a, const VLMWaypointCandidate& b) {
+            if (std::fabs(a.score - b.score) > 1e-6)
+              return a.score > b.score;
+            return a.path_length < b.path_length;
+          });
+      if (static_cast<int>(sector_candidates.size()) > max_sector_candidates)
+        sector_candidates.resize(max_sector_candidates);
+    };
+
+    for (int i = 0; i < ray_count; ++i) {
+      const double t = ray_count == 1 ? 0.5 : static_cast<double>(i) / static_cast<double>(ray_count - 1);
+      const double theta_deg = sector.min_deg + t * (sector.max_deg - sector.min_deg);
+      int sampled_pixels = 0;
+      int ray_u = -1;
+      const double r_free = estimateLocalViewRayFreeDistance(theta_deg, sampled_pixels, ray_u);
+      if (r_free <= 0.0) {
+        makeRejected(sector.label, theta_deg, 0.0, "no_valid_depth", r_free, ray_count);
+        continue;
+      }
+      valid_depth_rays++;
+
+      if (r_free < ep_->vlm_local_view_min_candidate_dist_ + ep_->vlm_local_view_safety_margin_) {
+        makeRejected(sector.label, theta_deg, 0.0, "insufficient_free_distance", r_free, ray_count);
+        continue;
+      }
+
+      const double max_safe_dist = std::min(ep_->vlm_local_view_max_candidate_dist_,
+          r_free - ep_->vlm_local_view_safety_margin_);
+      vector<double> candidate_distances;
+      auto addCandidateDistance = [&](double distance) {
+        if (distance < ep_->vlm_local_view_min_candidate_dist_ ||
+            distance > max_safe_dist ||
+            distance > ep_->vlm_local_view_max_candidate_dist_)
+          return;
+        for (const double existing : candidate_distances) {
+          if (std::fabs(existing - distance) < 0.18)
+            return;
+        }
+        candidate_distances.push_back(distance);
+      };
+      addCandidateDistance(ep_->vlm_local_view_micro_candidate_dist_);
+      addCandidateDistance(ep_->vlm_local_view_preferred_candidate_dist_);
+      addCandidateDistance(max_safe_dist);
+      if (candidate_distances.empty()) {
+        makeRejected(sector.label, theta_deg, max_safe_dist, "distance_out_of_range", r_free, ray_count);
+        continue;
+      }
+
+      for (const double candidate_dist : candidate_distances) {
+        const double theta_rad = theta_deg * M_PI / 180.0;
+        const double world_yaw = cur_yaw + theta_rad;
+        Vector2d goal(cur_pos(0) + candidate_dist * std::cos(world_yaw),
+            cur_pos(1) + candidate_dist * std::sin(world_yaw));
+
+        string reject_reason;
+        if (!sdf_map_->isInMap(goal))
+          reject_reason = "outside_costmap";
+        if (reject_reason.empty() &&
+            (goal(0) < map_min(0) + ep_->vlm_local_view_boundary_margin_m_ ||
+                goal(1) < map_min(1) + ep_->vlm_local_view_boundary_margin_m_ ||
+                goal(0) > map_max(0) - ep_->vlm_local_view_boundary_margin_m_ ||
+                goal(1) > map_max(1) - ep_->vlm_local_view_boundary_margin_m_))
+          reject_reason = "near_costmap_boundary";
+        if (reject_reason.empty() && isRejectedByVLMScan(goal))
+          reject_reason = "near_unselected_vlm_candidate";
+
+        const int occ = reject_reason.empty() ? sdf_map_->getOccupancy(goal) : SDFMap2D::UNKNOWN;
+        if (reject_reason.empty() && occ == SDFMap2D::UNKNOWN)
+          reject_reason = "unknown_cell";
+        if (reject_reason.empty() && occ == SDFMap2D::OCCUPIED)
+          reject_reason = "occupied_cell";
+        if (reject_reason.empty() && sdf_map_->getInflateOccupancy(goal) == 1)
+          reject_reason = "inflated_obstacle_cell";
+
+        double clearance = reject_reason.empty() ? sdf_map_->getDistance(goal) : -1.0;
+        if (reject_reason.empty() && clearance < ep_->vlm_local_view_min_clearance_)
+          reject_reason = "clearance_below_min";
+
+        if (reject_reason.empty()) {
+          const double clearance_sample_radius = std::max(ep_->vlm_local_view_min_clearance_,
+              ep_->vlm_local_view_boundary_margin_m_);
+          for (int k = 0; k < 8; ++k) {
+            const double angle = 2.0 * M_PI * static_cast<double>(k) / 8.0;
+            Vector2d clearance_sample(goal(0) + clearance_sample_radius * std::cos(angle),
+                goal(1) + clearance_sample_radius * std::sin(angle));
+            if (!sdf_map_->isInMap(clearance_sample)) {
+              reject_reason = "neighborhood_outside_costmap";
+              break;
+            }
+            const int sample_occ = sdf_map_->getOccupancy(clearance_sample);
+            if (sample_occ == SDFMap2D::UNKNOWN) {
+              reject_reason = "near_unknown_cell";
+              break;
+            }
+            if (sample_occ == SDFMap2D::OCCUPIED ||
+                sdf_map_->getInflateOccupancy(clearance_sample) == 1) {
+              reject_reason = "near_obstacle_boundary";
+              break;
+            }
+          }
+        }
+
+        vector<Vector2d> path;
+        double path_length = 0.0;
+        double path_ratio = 0.0;
+        if (reject_reason.empty()) {
+          path_finder_->reset();
+          const int search_result = path_finder_->astarSearch(cur_pos, goal, 0.15,
+              ep_->vlm_local_view_astar_max_time_, Astar2D::SAFETY_MODE::NORMAL);
+          if (search_result != Astar2D::REACH_END) {
+            reject_reason = "planner_unreachable";
+          }
+          else {
+            path = path_finder_->getPath();
+            path_length = Astar2D::pathLength(path);
+            path_ratio = candidate_dist > 1e-3 ? path_length / candidate_dist : std::numeric_limits<double>::max();
+            if (path.empty())
+              reject_reason = "planner_empty_path";
+            else if (path_ratio > ep_->vlm_local_view_path_ratio_max_)
+              reject_reason = "path_ratio_too_large";
+          }
+        }
+
+        int image_u = -1;
+        int image_v = -1;
+        double projected_depth = -1.0;
+        bool projection_proxy = false;
+        double projection_proxy_depth = -1.0;
+        const bool projected = reject_reason.empty() &&
+            projectCandidateToImageWithGroundProxy(cur_pos, cur_yaw, goal, image_width,
+                image_height, image_u, image_v, projected_depth, projection_proxy,
+                projection_proxy_depth);
+        if (reject_reason.empty() && !projected)
+          reject_reason = "projection_invalid";
+
+        if (!reject_reason.empty()) {
+          makeRejected(sector.label, theta_deg, candidate_dist, reject_reason, r_free, ray_count);
+          continue;
+        }
+
+        generated_candidates++;
+        const double clearance_score = clamp01(clearance / std::max(0.4, 3.0 * ep_->vlm_local_view_min_clearance_));
+        const double free_distance_score = clamp01(r_free / std::max(ep_->vlm_local_view_max_candidate_dist_, 1e-3));
+        const double preferred_span = std::max(ep_->vlm_local_view_preferred_candidate_dist_ -
+                ep_->vlm_local_view_min_candidate_dist_,
+            ep_->vlm_local_view_max_candidate_dist_ - ep_->vlm_local_view_preferred_candidate_dist_);
+        const double preferred_score = clamp01(1.0 - std::fabs(candidate_dist - ep_->vlm_local_view_preferred_candidate_dist_) /
+                std::max(1e-3, preferred_span));
+        const double sector_center_score = clamp01(1.0 - std::fabs(theta_deg - sector_center) / sector_half_width);
+        const double path_score = clamp01(1.0 - (path_ratio - 1.0) /
+                std::max(1e-3, ep_->vlm_local_view_path_ratio_max_ - 1.0));
+        const double edge_score = clamp01(1.0 - std::fabs(theta_deg) /
+                std::max(1e-3, 0.5 * ep_->vlm_local_view_hfov_deg_));
+        const double score = 0.25 * clearance_score + 0.20 * free_distance_score +
+            0.25 * preferred_score + 0.15 * sector_center_score + 0.10 * path_score +
+            0.05 * edge_score;
+
+        VLMWaypointCandidate candidate;
+        candidate.id = sector.label;
+        candidate.label = sector.label;
+        candidate.source = "local_view";
+        candidate.filtered = false;
+        candidate.filtered_reason.clear();
+        candidate.map_position = goal;
+        candidate.safe_goal = goal;
+        candidate.theta_deg = theta_deg;
+        candidate.euclidean_distance = candidate_dist;
+        candidate.path_length = path_length;
+        candidate.path_ratio = path_ratio;
+        candidate.clearance = clearance;
+        candidate.score = score;
+        candidate.free_distance = r_free;
+        candidate.sampled_ray_count = ray_count;
+        candidate.valid = true;
+        candidate.reject_reason.clear();
+        candidate.direction = directionLabel(cur_pos, cur_yaw, goal);
+        candidate.reachable = true;
+        candidate.frontier_size = 1;
+        candidate.recently_selected = isRecentlySelectedGoal(goal);
+        candidate.has_projection = true;
+        candidate.image_u = image_u;
+        candidate.image_v = image_v;
+        candidate.projected_depth = projected_depth;
+        candidate.projection_type = projection_proxy ? "ground_ray_proxy" : "exact";
+        candidate.projection_proxy = projection_proxy;
+        candidate.projection_proxy_depth = projection_proxy_depth;
+        candidate.path = path;
+
+        ROS_WARN("[VLM LocalView] candidate label=%s theta=%.1f dist=%.2f clearance=%.2f path=%.2f ratio=%.2f score=%.3f projection=%s rgb=(%d,%d) proxy_depth=%.2f",
+            candidate.label.c_str(), candidate.theta_deg, candidate.euclidean_distance,
+            candidate.clearance, candidate.path_length, candidate.path_ratio, candidate.score,
+            candidate.projection_type.c_str(), candidate.image_u, candidate.image_v,
+            candidate.projection_proxy_depth);
+
+        addSectorCandidate(candidate);
+      }
+    }
+
+    std::ostringstream selected_labels;
+    for (size_t k = 0; k < sector_candidates.size(); ++k) {
+      if (k > 0)
+        selected_labels << ",";
+      sector_candidates[k].id = sector.label + "_M" + std::to_string(k + 1);
+      sector_candidates[k].label = sector_candidates[k].id;
+      selected_labels << sector_candidates[k].id << ":" << std::fixed << std::setprecision(3)
+                      << sector_candidates[k].score;
+      local_candidates.push_back(sector_candidates[k]);
+    }
+    const string selected_text = sector_candidates.empty() ? string("none") : selected_labels.str();
+    ROS_WARN("[VLM LocalView] sector=%s sampled_rays=%d valid_depth_rays=%d generated=%d selected_count=%zu selected=%s",
+        sector.label.c_str(), ray_count, valid_depth_rays, generated_candidates,
+        sector_candidates.size(), selected_text.c_str());
+  }
+
+  ROS_WARN("[VLM LocalView] Accepted %zu local reachable candidate(s), rejected_records=%zu",
+      local_candidates.size(), vlm_last_local_view_rejected_candidates_.size());
+  return local_candidates;
+}
+
+vector<VLMWaypointCandidate> ExplorationManager::buildRecoveryWaypointCandidates(
+    const Vector2d& cur_pos, double cur_yaw, int image_width, int image_height,
+    int max_candidates)
+{
+  vector<VLMWaypointCandidate> recovery_candidates;
+  if (!ep_->vlm_recovery_candidates_enabled_ || !sdf_map_ || !path_finder_)
+    return recovery_candidates;
+
+  Eigen::Vector2d map_min, map_max;
+  sdf_map_->getMapBoundary(map_min, map_max);
+  const int target_count = std::max(1, max_candidates);
+  const double min_dist =
+      std::max(ep_->vlm_min_candidate_distance_, ep_->vlm_recovery_min_distance_);
+  const double max_dist =
+      std::max(min_dist, ep_->vlm_recovery_max_distance_);
+  const double min_clearance =
+      std::max(0.0, std::min(ep_->vlm_local_view_min_clearance_,
+                             ep_->vlm_recovery_min_clearance_));
+  const double micro_min_dist = std::max(0.20, 0.6 * min_dist);
+  const double micro_max_dist = std::max(micro_min_dist, std::min(max_dist, 1.20));
+  const double micro_min_clearance = std::min(min_clearance, 0.035);
+
+  auto clamp01 = [](double value) {
+    return std::min(1.0, std::max(0.0, value));
+  };
+
+  auto knownFree = [&](const Vector2d& point, double& clearance,
+                       double required_clearance, bool allow_inflated) {
+    if (!sdf_map_->isInMap(point))
+      return false;
+    if (point(0) < map_min(0) + 0.05 || point(1) < map_min(1) + 0.05 ||
+        point(0) > map_max(0) - 0.05 || point(1) > map_max(1) - 0.05)
+      return false;
+    const int occ = sdf_map_->getOccupancy(point);
+    if (occ == SDFMap2D::UNKNOWN || occ == SDFMap2D::OCCUPIED)
+      return false;
+    clearance = sdf_map_->getDistance(point);
+    if (!allow_inflated && sdf_map_->getInflateOccupancy(point) == 1)
+      return false;
+    if (clearance >= 0.0 && clearance < required_clearance)
+      return false;
+    return true;
+  };
+
+  auto straightLineLocallyFree = [&](const Vector2d& goal, double required_clearance,
+                                     bool allow_inflated) {
+    const double distance = (goal - cur_pos).norm();
+    if (distance < 1e-3)
+      return false;
+    const int steps = std::max(3, static_cast<int>(std::ceil(distance / 0.08)));
+    for (int i = 1; i <= steps; ++i) {
+      const double t = static_cast<double>(i) / static_cast<double>(steps);
+      const Vector2d point = cur_pos + t * (goal - cur_pos);
+      if (!sdf_map_->isInMap(point))
+        return false;
+      const int occ = sdf_map_->getOccupancy(point);
+      if (occ == SDFMap2D::UNKNOWN || occ == SDFMap2D::OCCUPIED)
+        return false;
+      const double clearance = sdf_map_->getDistance(point);
+      if (clearance >= 0.0 && clearance < required_clearance)
+        return false;
+      if (!allow_inflated && sdf_map_->getInflateOccupancy(point) == 1)
+        return false;
+    }
+    return true;
+  };
+
+  auto projectMicroEscapeProxy = [&](const Vector2d& goal, int& image_u, int& image_v,
+                                     double& projected_depth,
+                                     double& projection_proxy_depth,
+                                     string& projection_type) {
+    if (image_width <= 0 || image_height <= 0)
+      return false;
+    const double angle = std::atan2(goal(1) - cur_pos(1), goal(0) - cur_pos(0)) - cur_yaw;
+    double deg = angle * 180.0 / M_PI;
+    while (deg > 180.0) deg -= 360.0;
+    while (deg <= -180.0) deg += 360.0;
+    const int margin_x = std::max(12, static_cast<int>(std::round(0.05 * image_width)));
+    const int margin_y = std::max(14, static_cast<int>(std::round(0.06 * image_height)));
+    if (std::fabs(deg) <= 95.0)
+      return false;
+    image_u = deg > 0.0 ? margin_x : image_width - 1 - margin_x;
+    if (std::fabs(deg) >= 150.0)
+      image_u = image_width / 2;
+    image_v = image_height - 1 - margin_y;
+    projected_depth = (goal - cur_pos).norm();
+    projection_proxy_depth = projected_depth;
+    projection_type = std::fabs(deg) >= 150.0 ? "turnaround_escape_proxy"
+                                              : "side_escape_proxy";
+    return true;
+  };
+
+  auto duplicateGoal = [&](const Vector2d& goal) {
+    for (const auto& kept : recovery_candidates) {
+      if ((kept.safe_goal - goal).norm() < 0.28)
+        return true;
+    }
+    return false;
+  };
+
+	  auto addReachableGoal = [&](const Vector2d& raw_goal, double theta_deg,
+	                              double nominal_dist, const string& source_name) {
+	    const bool relaxed_escape = source_name == "micro_escape_proxy" ||
+	        source_name == "backtrack_escape_proxy";
+	    const bool backtrack_escape = source_name == "backtrack_escape_proxy";
+	    if (source_name == "micro_escape_proxy" && std::fabs(theta_deg) > 95.0) {
+	      ROS_WARN_THROTTLE(1.0,
+	          "[VLM Recovery] Skip reverse micro_escape_proxy theta=%.1f deg; do not expose back-facing escape goals to VLM",
+	          theta_deg);
+	      return;
+	    }
+	    const double local_min_dist = relaxed_escape ? micro_min_dist : min_dist;
+    double local_max_dist = max_dist;
+    if (relaxed_escape && !backtrack_escape)
+      local_max_dist = micro_max_dist;
+    const double local_min_clearance = relaxed_escape ? micro_min_clearance : min_clearance;
+    const bool allow_inflated_escape = relaxed_escape;
+
+    vector<Vector2d> samples;
+    samples.push_back(raw_goal);
+    const vector<double> radii = relaxed_escape
+        ? vector<double>{ 0.10, 0.20, 0.32, 0.46 }
+        : vector<double>{ 0.16, 0.30, 0.46, 0.62 };
+    for (const double radius : radii) {
+      for (int k = 0; k < 12; ++k) {
+        const double angle = 2.0 * M_PI * static_cast<double>(k) / 12.0;
+        samples.emplace_back(raw_goal(0) + radius * std::cos(angle),
+            raw_goal(1) + radius * std::sin(angle));
+      }
+    }
+
+    VLMWaypointCandidate best_candidate;
+    double best_score = -std::numeric_limits<double>::infinity();
+    bool have_best = false;
+
+    for (const auto& goal : samples) {
+      double clearance = -1.0;
+      if (!knownFree(goal, clearance, local_min_clearance, allow_inflated_escape)) {
+        continue;
+      }
+      if (duplicateGoal(goal) || isRejectedByVLMScan(goal))
+        continue;
+
+      const double euclidean = (goal - cur_pos).norm();
+      if (euclidean < local_min_dist || euclidean > local_max_dist)
+        continue;
+
+      bool direct_escape_path = false;
+      path_finder_->reset();
+      int search_result = path_finder_->astarSearch(cur_pos, goal, 0.15,
+          std::max(0.6, ep_->vlm_local_view_astar_max_time_), Astar2D::SAFETY_MODE::NORMAL);
+      if (search_result != Astar2D::REACH_END) {
+        path_finder_->reset();
+        search_result = path_finder_->astarSearch(cur_pos, goal, 0.15,
+            std::max(0.6, ep_->vlm_local_view_astar_max_time_),
+            Astar2D::SAFETY_MODE::OPTIMISTIC);
+      }
+      vector<Vector2d> path;
+      if (search_result == Astar2D::REACH_END) {
+        path = path_finder_->getPath();
+      }
+      else if (relaxed_escape &&
+          straightLineLocallyFree(goal, local_min_clearance, allow_inflated_escape)) {
+        path = { cur_pos, goal };
+        direct_escape_path = true;
+      }
+      if (path.empty())
+        continue;
+      double path_length = Astar2D::pathLength(path);
+      if (direct_escape_path)
+        path_length = std::max(path_length, 1.05 * euclidean);
+      const double path_ratio =
+          euclidean > 1e-3 ? path_length / euclidean : std::numeric_limits<double>::max();
+      if (!std::isfinite(path_ratio) || path_ratio > ep_->vlm_recovery_path_ratio_max_)
+        continue;
+
+      int image_u = -1;
+      int image_v = -1;
+      double projected_depth = -1.0;
+      bool projection_proxy = false;
+      double projection_proxy_depth = -1.0;
+      string projection_type = "none";
+      bool projected = projectCandidateToImageWithGroundProxy(cur_pos, cur_yaw, goal,
+          image_width, image_height, image_u, image_v, projected_depth, projection_proxy,
+          projection_proxy_depth);
+      if (projected) {
+        projection_type = projection_proxy ? "ground_ray_proxy" : "exact";
+      }
+      else if (projectCandidateToImageWithEdgeProxy(cur_pos, cur_yaw, goal, image_width,
+                   image_height, image_u, image_v, projected_depth, projection_proxy_depth)) {
+        projected = true;
+        projection_proxy = true;
+        projection_type = "edge_proxy";
+      }
+      else if (relaxed_escape && projectMicroEscapeProxy(goal, image_u, image_v,
+                   projected_depth, projection_proxy_depth, projection_type)) {
+        projected = true;
+        projection_proxy = true;
+      }
+      if (!projected)
+        continue;
+
+      const double clearance_score = clearance >= 0.0
+          ? clamp01(clearance / std::max(0.12, 2.5 * local_min_clearance))
+          : 0.5;
+      const double path_score = clamp01(1.0 - (path_ratio - 1.0) /
+          std::max(1e-3, ep_->vlm_recovery_path_ratio_max_ - 1.0));
+      const double dist_score =
+          clamp01(1.0 - std::fabs(euclidean - (relaxed_escape ? 0.55 : 1.15)) /
+              std::max(1.0, local_max_dist));
+      const double center_score = relaxed_escape
+          ? clamp01(1.0 - std::fabs(theta_deg) / 180.0)
+          : clamp01(1.0 - std::fabs(theta_deg) / 90.0);
+      const double projection_score = projection_type == "exact" ? 1.0 :
+          (projection_type == "ground_ray_proxy" ? 0.78 :
+              (projection_type == "edge_proxy" ? 0.55 : 0.42));
+      const double score = 0.28 * clearance_score + 0.24 * path_score +
+          0.22 * dist_score + 0.14 * center_score + 0.12 * projection_score;
+
+      if (score <= best_score)
+        continue;
+
+      VLMWaypointCandidate candidate;
+      candidate.source = source_name;
+      candidate.filtered = false;
+      candidate.filtered_reason.clear();
+      candidate.map_position = raw_goal;
+      candidate.safe_goal = goal;
+      candidate.theta_deg = theta_deg;
+      candidate.euclidean_distance = euclidean;
+      candidate.path_length = path_length;
+      candidate.path_ratio = path_ratio;
+      candidate.clearance = clearance;
+      candidate.score = score;
+      candidate.free_distance = nominal_dist;
+      candidate.sampled_ray_count = static_cast<int>(samples.size());
+      candidate.valid = true;
+      candidate.reject_reason.clear();
+      candidate.direction = directionLabel(cur_pos, cur_yaw, goal);
+      candidate.reachable = true;
+      candidate.frontier_size = 1;
+      candidate.recently_selected = isRecentlySelectedGoal(goal);
+      candidate.has_projection = true;
+      candidate.image_u = image_u;
+      candidate.image_v = image_v;
+      candidate.projected_depth = projected_depth;
+      candidate.projection_type = projection_type;
+      candidate.projection_proxy = projection_proxy;
+      candidate.projection_proxy_depth = projection_proxy_depth;
+      candidate.path = path;
+
+      best_candidate = candidate;
+      best_score = score;
+      have_best = true;
+    }
+
+    if (!have_best)
+      return;
+
+    recovery_candidates.push_back(best_candidate);
+    std::stable_sort(recovery_candidates.begin(), recovery_candidates.end(),
+        [](const VLMWaypointCandidate& a, const VLMWaypointCandidate& b) {
+          if (std::fabs(a.score - b.score) > 1e-6)
+            return a.score > b.score;
+          return a.path_length < b.path_length;
+        });
+    if (static_cast<int>(recovery_candidates.size()) > target_count)
+      recovery_candidates.resize(target_count);
+  };
+
+  const vector<double> theta_degs = {
+    0.0, -18.0, 18.0, -34.0, 34.0, -52.0, 52.0, -72.0, 72.0
+  };
+  const vector<double> distances = {
+    min_dist, 0.65, 0.90, 1.15, 1.45, 1.80, max_dist
+  };
+
+  for (const double theta_deg : theta_degs) {
+    for (const double distance : distances) {
+      if (static_cast<int>(recovery_candidates.size()) >= target_count &&
+          std::fabs(theta_deg) > 52.0)
+        continue;
+      const double clamped_distance = std::min(max_dist, std::max(min_dist, distance));
+      const double world_yaw = cur_yaw + theta_deg * M_PI / 180.0;
+      const Vector2d raw_goal(cur_pos(0) + clamped_distance * std::cos(world_yaw),
+          cur_pos(1) + clamped_distance * std::sin(world_yaw));
+      addReachableGoal(raw_goal, theta_deg, clamped_distance, "recovery_proxy");
+    }
+  }
+
+  if (static_cast<int>(recovery_candidates.size()) < target_count) {
+    for (auto it = vlm_recent_goals_.rbegin(); it != vlm_recent_goals_.rend(); ++it) {
+      if (static_cast<int>(recovery_candidates.size()) >= target_count)
+        break;
+      const Vector2d recent_goal = *it;
+      const double distance = (recent_goal - cur_pos).norm();
+      if (distance < micro_min_dist || distance > max_dist)
+        continue;
+      double theta_deg = (std::atan2(recent_goal(1) - cur_pos(1),
+                            recent_goal(0) - cur_pos(0)) - cur_yaw) *
+          180.0 / M_PI;
+      while (theta_deg > 180.0) theta_deg -= 360.0;
+      while (theta_deg <= -180.0) theta_deg += 360.0;
+      addReachableGoal(recent_goal, theta_deg, distance, "backtrack_escape_proxy");
+    }
+  }
+
+  if (static_cast<int>(recovery_candidates.size()) < target_count) {
+    const vector<double> micro_theta_degs = {
+      0.0, -15.0, 15.0, -30.0, 30.0, -45.0, 45.0, -60.0, 60.0,
+      -90.0, 90.0, -120.0, 120.0, -150.0, 150.0, 180.0
+    };
+    const vector<double> micro_distances = {
+      micro_min_dist, 0.32, 0.45, 0.65, 0.90, micro_max_dist
+    };
+    for (const double theta_deg : micro_theta_degs) {
+      for (const double distance : micro_distances) {
+        if (static_cast<int>(recovery_candidates.size()) >= target_count)
+          break;
+        const double clamped_distance =
+            std::min(micro_max_dist, std::max(micro_min_dist, distance));
+        const double world_yaw = cur_yaw + theta_deg * M_PI / 180.0;
+        const Vector2d raw_goal(cur_pos(0) + clamped_distance * std::cos(world_yaw),
+            cur_pos(1) + clamped_distance * std::sin(world_yaw));
+        addReachableGoal(raw_goal, theta_deg, clamped_distance, "micro_escape_proxy");
+      }
+    }
+  }
+
+  for (size_t i = 0; i < recovery_candidates.size(); ++i) {
+    recovery_candidates[i].id = "RC" + std::to_string(i + 1);
+    recovery_candidates[i].label = recovery_candidates[i].id;
+  }
+
+  ROS_WARN("[VLM Recovery] Generated %zu recovery/connector candidate(s), requested=%d",
+      recovery_candidates.size(), target_count);
+  return recovery_candidates;
+}
+
+string ExplorationManager::extractJsonArrayField(const string& result_json, const string& key) const
+{
+  const string token = "\"" + key + "\"";
+  size_t pos = result_json.find(token);
+  if (pos == string::npos)
+    return "[]";
+  pos = result_json.find('[', pos);
+  if (pos == string::npos)
+    return "[]";
+
+  bool in_string = false;
+  bool escaped = false;
+  int depth = 0;
+  for (size_t i = pos; i < result_json.size(); ++i) {
+    const char ch = result_json[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch == '\\' && in_string) {
+      escaped = true;
+      continue;
+    }
+    if (ch == '"') {
+      in_string = !in_string;
+      continue;
+    }
+    if (in_string)
+      continue;
+    if (ch == '[')
+      depth++;
+    else if (ch == ']') {
+      depth--;
+      if (depth == 0)
+        return result_json.substr(pos, i - pos + 1);
+    }
+  }
+  return "[]";
+}
+
+
+void ExplorationManager::writeActualCandidateReferenceLabel(const string& request_id,
+    const Vector2d& cur_pos, double cur_yaw, const vector<VLMWaypointCandidate>& candidates,
+    const VLMDecisionResult& online_decision)
+{
+  if (!isOracleFrontierLabelOnlyMode())
+    return;
+
+  vector<VLMWaypointCandidate> visible_candidates;
+  for (const auto& candidate : candidates) {
+    if (candidate.reachable && candidate.has_projection)
+      visible_candidates.push_back(candidate);
+  }
+  if (visible_candidates.empty()) {
+    vector<FrontierOracleCandidateScore> empty_scores;
+    writeFrontierOracleLogAndImage(request_id, cur_pos, cur_yaw, visible_candidates,
+        empty_scores, string(), "Label-only reference found no visible candidates after online decision " +
+            online_decision.decision + ".");
+    return;
+  }
+
+  vector<FrontierOracleCandidateScore> scores =
+      requestFrontierOracleScores(request_id + "_label", cur_pos, visible_candidates);
+  int best_idx = -1;
+  double best_progress = -std::numeric_limits<double>::infinity();
+  double best_ratio = -std::numeric_limits<double>::infinity();
+  double best_endpoint = std::numeric_limits<double>::infinity();
+  for (size_t i = 0; i < scores.size(); ++i) {
+    const auto& score = scores[i];
+    if (!score.gt_path_available)
+      continue;
+    const bool qualified =
+        score.endpoint_to_gt_path <= ep_->oracle_frontier_gt_path_deviation_threshold_ &&
+        score.gt_path_progress >= ep_->oracle_frontier_min_gt_path_progress_to_select_;
+    if (!qualified)
+      continue;
+    const double ratio = std::isfinite(score.progress_per_cost) ? score.progress_per_cost : 0.0;
+    if (score.gt_path_progress > best_progress + 1e-6 ||
+        (std::fabs(score.gt_path_progress - best_progress) <= 1e-6 &&
+            (ratio > best_ratio + 1e-6 ||
+                (std::fabs(ratio - best_ratio) <= 1e-6 &&
+                    score.endpoint_to_gt_path < best_endpoint)))) {
+      best_idx = static_cast<int>(i);
+      best_progress = score.gt_path_progress;
+      best_ratio = ratio;
+      best_endpoint = score.endpoint_to_gt_path;
+    }
+  }
+
+  if (best_idx < 0) {
+    double best_total = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < scores.size(); ++i) {
+      const auto& score = scores[i];
+      if (score.total_geodesic < best_total) {
+        best_idx = static_cast<int>(i);
+        best_total = score.total_geodesic;
+      }
+    }
+  }
+
+  string selected_id;
+  std::ostringstream reason;
+  reason << std::fixed << std::setprecision(3)
+         << "Label-only actual-candidate reference after online_decision="
+         << online_decision.decision << ", online_selected=" << online_decision.selected_id
+         << ". ";
+  if (best_idx >= 0 && best_idx < static_cast<int>(visible_candidates.size())) {
+    selected_id = visible_candidates[best_idx].id;
+    const auto& score = scores[best_idx];
+    reason << "Selected " << selected_id
+           << " within the same visible/reachable candidate set; endpoint_to_gt_path="
+           << score.endpoint_to_gt_path << ", gt_path_progress=" << score.gt_path_progress
+           << ", progress_per_cost=" << score.progress_per_cost
+           << ", source=" << score.source << ".";
+  }
+  else {
+    reason << "No reliable waypoint reference; scan hint is "
+           << oracle_scan_direction_hint_ << ".";
+  }
+  writeFrontierOracleLogAndImage(
+      request_id, cur_pos, cur_yaw, visible_candidates, scores, selected_id, reason.str());
+}
+
+bool ExplorationManager::parseVLMDecision(const string& result_json, VLMDecisionResult& decision) const
+{
+  auto parseJsonStringAt = [&](size_t pos, string& value) -> bool {
+    if (pos == string::npos || pos >= result_json.size() || result_json[pos] != '"')
+      return false;
+    string decoded;
+    bool escaped = false;
+    for (size_t i = pos + 1; i < result_json.size(); ++i) {
+      const char ch = result_json[i];
+      if (escaped) {
+        switch (ch) {
+          case '"': decoded.push_back('"'); break;
+          case '\\': decoded.push_back('\\'); break;
+          case '/': decoded.push_back('/'); break;
+          case 'b': decoded.push_back('\b'); break;
+          case 'f': decoded.push_back('\f'); break;
+          case 'n': decoded.push_back('\n'); break;
+          case 'r': decoded.push_back('\r'); break;
+          case 't': decoded.push_back('\t'); break;
+          default: decoded.push_back(ch); break;
+        }
+        escaped = false;
+        continue;
+      }
+      if (ch == '\\') {
+        escaped = true;
+        continue;
+      }
+      if (ch == '"') {
+        value = decoded;
+        return true;
+      }
+      decoded.push_back(ch);
+    }
+    return false;
+  };
+
+  auto findTopLevelValuePos = [&](const string& key) -> size_t {
+    int object_depth = 0;
+    int array_depth = 0;
+    bool escaped = false;
+    bool in_string = false;
+
+    for (size_t i = 0; i < result_json.size(); ++i) {
+      const char ch = result_json[i];
+      if (in_string) {
+        if (escaped) {
+          escaped = false;
+          continue;
+        }
+        if (ch == '\\') {
+          escaped = true;
+          continue;
+        }
+        if (ch == '"')
+          in_string = false;
+        continue;
+      }
+
+      if (ch == '{') {
+        object_depth++;
+        continue;
+      }
+      if (ch == '}') {
+        object_depth--;
+        continue;
+      }
+      if (ch == '[') {
+        array_depth++;
+        continue;
+      }
+      if (ch == ']') {
+        array_depth--;
+        continue;
+      }
+      if (ch != '"')
+        continue;
+
+      if (object_depth != 1 || array_depth != 0) {
+        in_string = true;
+        continue;
+      }
+
+      string parsed_key;
+      if (!parseJsonStringAt(i, parsed_key))
+        return string::npos;
+      bool key_escape = false;
+      size_t end = i + 1;
+      for (; end < result_json.size(); ++end) {
+        const char c = result_json[end];
+        if (key_escape) {
+          key_escape = false;
+          continue;
+        }
+        if (c == '\\') {
+          key_escape = true;
+          continue;
+        }
+        if (c == '"')
+          break;
+      }
+      if (end == result_json.size())
+        return string::npos;
+
+      size_t colon = result_json.find_first_not_of(" \t\r\n", end + 1);
+      if (colon == string::npos || result_json[colon] != ':') {
+        i = end;
+        continue;
+      }
+      if (parsed_key != key) {
+        i = end;
+        continue;
+      }
+      return result_json.find_first_not_of(" \t\r\n", colon + 1);
+    }
+    return string::npos;
+  };
+
+  auto parseStringField = [&](const string& key, string& value) -> bool {
+    const size_t pos = findTopLevelValuePos(key);
+    return parseJsonStringAt(pos, value);
+  };
+
+  auto parseDoubleField = [&](const string& key, double& value) -> bool {
+    const size_t start = findTopLevelValuePos(key);
+    if (start == string::npos)
+      return false;
+    const size_t number_start = result_json.find_first_of("-0123456789.", start);
+    if (number_start == string::npos || number_start != start)
+      return false;
+    const size_t end = result_json.find_first_not_of("-0123456789.eE+", number_start);
+    try {
+      value = std::stod(result_json.substr(number_start, end - number_start));
+      return true;
+    }
+    catch (...) {
+      return false;
+    }
+  };
+
+  decision = VLMDecisionResult();
+  decision.raw_response = result_json;
+  parseStringField("decision", decision.decision);
+  parseStringField("selected", decision.selected_id);
+  parseStringField("front_scene_type", decision.front_scene_type);
+  parseStringField("reason", decision.reason);
+  parseStringField("fallback_reason", decision.fallback_reason);
+  parseDoubleField("confidence", decision.confidence);
+  decision.candidate_analysis_json = extractJsonArrayField(result_json, "candidate_analysis");
+  decision.fallback = result_json.find("\"fallback\": true") != string::npos ||
+                      result_json.find("\"fallback\":true") != string::npos;
+
+  if (decision.decision.empty() && decision.fallback)
+    decision.decision = "SELECT_WAYPOINT";
+  return decision.fallback || decision.decision == "SELECT_WAYPOINT" ||
+         decision.decision == "LOOK_LEFT_60" || decision.decision == "LOOK_RIGHT_60";
+}
+
+void ExplorationManager::resetVLMScanContext(const string& reason)
+{
+  if (vlm_scan_context_active_ || vlm_scan_count_ > 0 || pending_vlm_forced_action_steps_ > 0) {
+    ROS_WARN("[VLM Scan] Reset scan context, reason=%s, scan_count=%d, cumulative_angle=%.1f",
+        reason.c_str(), vlm_scan_count_, vlm_cumulative_scan_angle_deg_);
+  }
+  vlm_scan_context_active_ = false;
+  vlm_scan_count_ = 0;
+  vlm_cumulative_scan_angle_deg_ = 0.0;
+  vlm_scan_last_action_.clear();
+  vlm_scan_last_reason_.clear();
+  vlm_inspected_views_json_.clear();
+  vlm_scan_panorama_views_.clear();
+  pending_vlm_forced_action_ = -1;
+  pending_vlm_forced_action_steps_ = 0;
+}
+
+void ExplorationManager::resetInitialVLMPanorama(const string& reason)
+{
+  if (!vlm_initial_panorama_views_.empty() || vlm_initial_panorama_consumed_) {
+    ROS_WARN("[VLM Initial Panorama] Reset initial panorama, reason=%s, views=%zu, consumed=%s",
+        reason.c_str(), vlm_initial_panorama_views_.size(),
+        vlm_initial_panorama_consumed_ ? "true" : "false");
+  }
+  vlm_initial_panorama_views_.clear();
+  vlm_initial_panorama_consumed_ = false;
+  vlm_initial_panorama_have_start_yaw_ = false;
+  vlm_initial_panorama_start_yaw_ = 0.0;
+  vlm_initial_panorama_view_counter_ = 0;
+}
+
+void ExplorationManager::recordInitialVLMPanoramaView(const Vector2d& cur_pos, double cur_yaw,
+    const vector<Vector2d>& frontiers, int init_action_count)
+{
+  if (!ep_ || !ep_->use_vlm_guided_geometric_ ||
+      !ep_->vlm_initial_panorama_selection_enabled_ || vlm_initial_panorama_consumed_)
+    return;
+
+  if (!have_latest_rgb_ || latest_rgb_image_.empty()) {
+    ROS_WARN_THROTTLE(2.0, "[VLM Initial Panorama] Skip view: latest RGB image unavailable.");
+    return;
+  }
+
+  const string image_dir = ep_->vlm_debug_dir_ + "/vlm_initial_panorama";
+  const int image_dir_status = std::system(("mkdir -p " + shellQuote(image_dir)).c_str());
+  if (image_dir_status != 0)
+    return;
+
+  if (!vlm_initial_panorama_have_start_yaw_) {
+    vlm_initial_panorama_start_yaw_ = cur_yaw;
+    vlm_initial_panorama_have_start_yaw_ = true;
+  }
+
+  auto normalizeDeg = [](double deg) {
+    while (deg > 180.0) deg -= 360.0;
+    while (deg <= -180.0) deg += 360.0;
+    return deg;
+  };
+
+  const int view_index = vlm_initial_panorama_view_counter_++;
+  const string view_id = "P" + std::to_string(view_index + 1);
+  const string request_prefix = "epi" + std::to_string(episode_index_) + "_init_" +
+      std::to_string(init_action_count) + "_" + view_id;
+  const string raw_image_path = image_dir + "/" + request_prefix + "_raw.png";
+  const string depth_image_path = image_dir + "/" + request_prefix + "_depth.png";
+
+  string image_error;
+  if (!saveLatestRGBImage(raw_image_path, image_error)) {
+    ROS_WARN("[VLM Initial Panorama] Skip view %s: %s", view_id.c_str(), image_error.c_str());
+    return;
+  }
+  string depth_error;
+  const bool saved_depth = saveLatestDepthImage(depth_image_path, depth_error);
+  if (!saved_depth)
+    ROS_WARN_THROTTLE(2.0, "[VLM Initial Panorama] Depth image unavailable: %s",
+        depth_error.c_str());
+
+  vector<VLMWaypointCandidate> candidates = buildVLMWaypointCandidates(cur_pos, cur_yaw, frontiers);
+  vector<VLMWaypointCandidate> visible_candidates;
+  for (auto candidate : candidates) {
+    if (!candidate.reachable || !candidate.has_projection)
+      continue;
+    const string original_id = candidate.id;
+    candidate.id = view_id + "_" + original_id;
+    candidate.label = candidate.id;
+    visible_candidates.push_back(candidate);
+  }
+
+  VLMInitialPanoramaView view;
+  view.view_id = view_id;
+  view.view_index = view_index;
+  view.init_action_count = init_action_count;
+  view.yaw = cur_yaw;
+  view.relative_yaw_deg = normalizeDeg((cur_yaw - vlm_initial_panorama_start_yaw_) * 180.0 / M_PI);
+  view.robot = cur_pos;
+  view.raw_image_path = raw_image_path;
+  view.depth_image_path = saved_depth ? depth_image_path : "";
+  view.candidates = visible_candidates;
+  vlm_initial_panorama_views_.push_back(view);
+
+  ROS_WARN("[VLM Initial Panorama] Captured %s init_count=%d rel_yaw=%.1f visible_candidates=%zu",
+      view.view_id.c_str(), init_action_count, view.relative_yaw_deg,
+      view.candidates.size());
+}
+
+void ExplorationManager::recordVLMScanPanoramaView(const string& request_id,
+    const Vector2d& cur_pos, double cur_yaw, const vector<VLMWaypointCandidate>& candidates)
+{
+  if (!ep_ || !ep_->use_vlm_guided_geometric_)
+    return;
+
+  const string image_dir = ep_->vlm_debug_dir_ + "/vlm_waypoints";
+  const string raw_image_path = image_dir + "/" + request_id + "_raw.png";
+  const string depth_image_path = image_dir + "/" + request_id + "_depth.png";
+  const string annotated_image_path = image_dir + "/" + request_id + "_annotated.png";
+  auto fileExists = [](const string& path) {
+    std::ifstream file(path);
+    return file.good();
+  };
+  const bool annotated_exists = fileExists(annotated_image_path);
+  const bool raw_exists = fileExists(raw_image_path);
+  if (!annotated_exists && !raw_exists) {
+    ROS_WARN("[VLM Scan Panorama] Skip scan view request=%s: no RGB source image available",
+        request_id.c_str());
+    return;
+  }
+
+  auto normalizeDeg = [](double deg) {
+    while (deg > 180.0) deg -= 360.0;
+    while (deg <= -180.0) deg += 360.0;
+    return deg;
+  };
+
+  const int view_index = static_cast<int>(vlm_scan_panorama_views_.size());
+  const string view_id = "S" + std::to_string(view_index + 1);
+  vector<VLMWaypointCandidate> visible_candidates;
+  for (auto candidate : candidates) {
+    if (!candidate.reachable || !candidate.has_projection)
+      continue;
+    const string original_id = candidate.id;
+    candidate.id = view_id + "_" + original_id;
+    candidate.label = candidate.id;
+    visible_candidates.push_back(candidate);
+  }
+
+  VLMInitialPanoramaView view;
+  view.view_id = view_id;
+  view.view_index = view_index;
+  view.init_action_count = vlm_scan_count_;
+  view.yaw = cur_yaw;
+  view.relative_yaw_deg = normalizeDeg(vlm_cumulative_scan_angle_deg_);
+  view.robot = cur_pos;
+  view.raw_image_path = annotated_exists ? annotated_image_path : raw_image_path;
+  view.depth_image_path = fileExists(depth_image_path) ? depth_image_path : "";
+  view.candidates = visible_candidates;
+  vlm_scan_panorama_views_.push_back(view);
+
+  ROS_WARN("[VLM Scan Panorama] Captured %s request=%s rel_yaw=%.1f visible_candidates=%zu",
+      view.view_id.c_str(), request_id.c_str(), view.relative_yaw_deg,
+      view.candidates.size());
+}
+
+bool ExplorationManager::selectWaypointWithInitialPanoramaVLM(const string& request_id,
+    const Vector2d& cur_pos, double cur_yaw, vector<VLMWaypointCandidate>& candidates,
+    VLMDecisionResult& decision, VLMWaypointCandidate& selected)
+{
+  decision = VLMDecisionResult();
+  candidates.clear();
+
+  if (vlm_initial_panorama_views_.empty()) {
+    decision.fallback = true;
+    decision.fallback_reason = "initial_panorama_no_views";
+    return false;
+  }
+
+  const string log_dir = ep_->vlm_debug_dir_ + "/vlm_waypoint_logs";
+  const int log_dir_status = std::system(("mkdir -p " + shellQuote(log_dir)).c_str());
+  if (log_dir_status != 0) {
+    decision.fallback = true;
+    decision.fallback_reason = "debug_directory_create_failed";
+    return false;
+  }
+
+  for (const auto& view : vlm_initial_panorama_views_) {
+    for (const auto& candidate : view.candidates)
+      candidates.push_back(candidate);
+  }
+
+  const string candidate_json_path = log_dir + "/" + request_id + "_candidates.json";
+  const string result_json_path = log_dir + "/" + request_id + "_vlm_result.json";
+  std::ofstream candidates_file(candidate_json_path);
+  if (!candidates_file.is_open()) {
+    decision.fallback = true;
+    decision.fallback_reason = "candidate_json_open_failed";
+    return false;
+  }
+
+  candidates_file << std::fixed << std::setprecision(4);
+  candidates_file << "{\n";
+  candidates_file << "  \"target\": \"" << jsonEscape(target_label_) << "\",\n";
+  candidates_file << "  \"episode\": " << episode_index_ << ",\n";
+  candidates_file << "  \"step\": " << vlm_request_counter_ << ",\n";
+  candidates_file << "  \"mode\": \"vlm_initial_panorama\",\n";
+  candidates_file << "  \"robot\": {\"x\": " << cur_pos(0) << ", \"y\": " << cur_pos(1)
+                  << ", \"yaw\": " << cur_yaw << "},\n";
+  writeVLMDetectorSemanticMapSnapshot(candidates_file, cur_pos, cur_yaw);
+  writeVLMMetricMapSummary(candidates_file);
+  candidates_file << "  \"vlm_config\": {\"look_angle_deg\": " << ep_->vlm_look_angle_deg_
+                  << ", \"max_scan_steps\": " << ep_->vlm_max_scan_steps_
+                  << ", \"default_uncertain_turn\": \""
+                  << jsonEscape(ep_->vlm_default_uncertain_turn_) << "\"},\n";
+  candidates_file << "  \"panorama_views\": [\n";
+  for (size_t i = 0; i < vlm_initial_panorama_views_.size(); ++i) {
+    const auto& view = vlm_initial_panorama_views_[i];
+    candidates_file << "    {\"view_id\": \"" << jsonEscape(view.view_id)
+                    << "\", \"view_index\": " << view.view_index
+                    << ", \"init_action_count\": " << view.init_action_count
+                    << ", \"relative_yaw_deg\": " << view.relative_yaw_deg
+                    << ", \"yaw\": " << view.yaw
+                    << ", \"robot\": {\"x\": " << view.robot(0)
+                    << ", \"y\": " << view.robot(1) << "}"
+                    << ", \"raw_image\": \"" << jsonEscape(view.raw_image_path)
+                    << "\", \"depth_image\": ";
+    if (view.depth_image_path.empty())
+      candidates_file << "null";
+    else
+      candidates_file << "\"" << jsonEscape(view.depth_image_path) << "\"";
+    candidates_file << ", \"candidate_count\": " << view.candidates.size() << "}";
+    if (i + 1 < vlm_initial_panorama_views_.size())
+      candidates_file << ",";
+    candidates_file << "\n";
+  }
+  candidates_file << "  ],\n";
+  candidates_file << "  \"scan_context\": {\"active\": false, \"scan_count\": 0, "
+                  << "\"cumulative_angle_deg\": 0.0, \"last_action\": null, "
+                  << "\"last_reason\": null, \"inspected_views\": []},\n";
+  candidates_file << "  \"candidates\": [\n";
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    const auto& c = candidates[i];
+    string view_id = "";
+    double view_angle = 0.0;
+    int view_index = -1;
+    for (const auto& view : vlm_initial_panorama_views_) {
+      bool found = false;
+      for (const auto& view_candidate : view.candidates) {
+        if (view_candidate.id == c.id) {
+          view_id = view.view_id;
+          view_angle = view.relative_yaw_deg;
+          view_index = view.view_index;
+          found = true;
+          break;
+        }
+      }
+      if (found)
+        break;
+    }
+    candidates_file << "    {\"id\": \"" << jsonEscape(c.id) << "\", \"label\": \""
+                    << jsonEscape(c.label.empty() ? c.id : c.label)
+                    << "\", \"view_id\": \"" << jsonEscape(view_id)
+                    << "\", \"view_index\": " << view_index
+                    << ", \"view_angle_deg\": " << view_angle
+                    << ", \"source\": \"" << jsonEscape(c.source)
+                    << "\", \"map\": [" << c.map_position(0) << ", " << c.map_position(1)
+                    << "], \"safe_goal\": [" << c.safe_goal(0) << ", " << c.safe_goal(1)
+                    << "], \"theta_deg\": " << c.theta_deg
+                    << ", \"distance\": " << c.euclidean_distance
+                    << ", \"path_length\": " << c.path_length
+                    << ", \"path_ratio\": " << c.path_ratio
+                    << ", \"score\": " << c.score
+                    << ", \"free_distance\": " << c.free_distance
+                    << ", \"sampled_ray_count\": " << c.sampled_ray_count
+                    << ", \"direction\": \"" << jsonEscape(c.direction)
+                    << "\", \"reachable\": " << (c.reachable ? "true" : "false")
+                    << ", \"valid\": " << (c.valid ? "true" : "false")
+                    << ", \"reject_reason\": \"" << jsonEscape(c.reject_reason)
+                    << "\", \"frontier_size\": " << c.frontier_size
+                    << ", \"clearance\": " << c.clearance
+                    << ", \"visited_recently\": "
+                    << (c.recently_selected ? "true" : "false")
+                    << ", \"projection\": ";
+    if (c.has_projection)
+      candidates_file << "[" << c.image_u << ", " << c.image_v << "]";
+    else
+      candidates_file << "null";
+    candidates_file << ", \"projected_depth\": " << c.projected_depth
+                    << ", \"projection_type\": \"" << jsonEscape(c.projection_type)
+                    << "\", \"projection_proxy\": "
+                    << (c.projection_proxy ? "true" : "false")
+                    << ", \"projection_proxy_depth\": "
+                    << c.projection_proxy_depth << "}";
+    if (i + 1 < candidates.size())
+      candidates_file << ",";
+    candidates_file << "\n";
+  }
+  candidates_file << "  ]\n";
+  candidates_file << "}\n";
+  candidates_file.close();
+
+  const string image_arg = vlm_initial_panorama_views_.front().raw_image_path;
+  string command = ep_->vlm_python_executable_ + " " + shellQuote(ep_->vlm_selector_script_) +
+                   " --candidate-json " + shellQuote(candidate_json_path) + " --image " +
+                   shellQuote(image_arg) + " --output-json " + shellQuote(result_json_path) +
+                   " --target " + shellQuote(target_label_) + " --episode " +
+                   std::to_string(episode_index_) + " --step " +
+                   std::to_string(vlm_request_counter_) + " --mode vlm_initial_panorama";
+
+  const int ret = std::system(command.c_str());
+  std::ifstream result_file(result_json_path);
+  if (!result_file.is_open()) {
+    decision.fallback = true;
+    decision.fallback_reason = ret == 0 ? "vlm_result_missing" : "vlm_selector_failed";
+    return false;
+  }
+
+  std::stringstream buffer;
+  buffer << result_file.rdbuf();
+  const string raw_response = buffer.str();
+  if (!parseVLMDecision(raw_response, decision)) {
+    decision.fallback = true;
+    decision.fallback_reason =
+        decision.fallback_reason.empty() ? "invalid_vlm_json" : decision.fallback_reason;
+    return false;
+  }
+  decision.raw_response = raw_response;
+
+  if (decision.fallback)
+    return false;
+  if (isVLMForcedLookDecision(decision.decision))
+    return true;
+  if (decision.decision != "SELECT_WAYPOINT") {
+    decision.fallback = true;
+    decision.fallback_reason = "unknown_decision";
+    return false;
+  }
+
+  for (const auto& candidate : candidates) {
+    if (candidate.id == decision.selected_id && candidate.reachable && candidate.has_projection) {
+      selected = candidate;
+      return true;
+    }
+  }
+
+  decision.fallback = true;
+  decision.fallback_reason = "invalid_or_unprojected_selected_panorama_waypoint";
+  return false;
+}
+
+bool ExplorationManager::selectWaypointWithScanPanoramaVLM(const string& request_id,
+    const Vector2d& cur_pos, double cur_yaw, vector<VLMWaypointCandidate>& candidates,
+    VLMDecisionResult& decision, VLMWaypointCandidate& selected)
+{
+  decision = VLMDecisionResult();
+  candidates.clear();
+
+  if (vlm_scan_panorama_views_.empty()) {
+    decision.fallback = true;
+    decision.fallback_reason = "scan_panorama_no_views";
+    return false;
+  }
+
+  const string log_dir = ep_->vlm_debug_dir_ + "/vlm_waypoint_logs";
+  const int log_dir_status = std::system(("mkdir -p " + shellQuote(log_dir)).c_str());
+  if (log_dir_status != 0) {
+    decision.fallback = true;
+    decision.fallback_reason = "debug_directory_create_failed";
+    return false;
+  }
+
+  for (const auto& view : vlm_scan_panorama_views_) {
+    for (const auto& candidate : view.candidates) {
+      if (candidate.reachable && candidate.has_projection)
+        candidates.push_back(candidate);
+    }
+  }
+
+  if (candidates.empty()) {
+    decision.fallback = true;
+    decision.fallback_reason = "scan_panorama_no_visible_candidates";
+    return false;
+  }
+
+  const string candidate_json_path = log_dir + "/" + request_id + "_candidates.json";
+  const string result_json_path = log_dir + "/" + request_id + "_vlm_result.json";
+  std::ofstream candidates_file(candidate_json_path);
+  if (!candidates_file.is_open()) {
+    decision.fallback = true;
+    decision.fallback_reason = "candidate_json_open_failed";
+    return false;
+  }
+
+  candidates_file << std::fixed << std::setprecision(4);
+  candidates_file << "{\n";
+  candidates_file << "  \"target\": \"" << jsonEscape(target_label_) << "\",\n";
+  candidates_file << "  \"episode\": " << episode_index_ << ",\n";
+  candidates_file << "  \"step\": " << vlm_request_counter_ << ",\n";
+  candidates_file << "  \"mode\": \"vlm_scan_full_circle_choice\",\n";
+  candidates_file << "  \"full_scan_completed\": true,\n";
+  candidates_file << "  \"force_select_waypoint\": true,\n";
+  candidates_file << "  \"robot\": {\"x\": " << cur_pos(0) << ", \"y\": " << cur_pos(1)
+                  << ", \"yaw\": " << cur_yaw << "},\n";
+  writeVLMDetectorSemanticMapSnapshot(candidates_file, cur_pos, cur_yaw);
+  writeVLMMetricMapSummary(candidates_file);
+  candidates_file << "  \"vlm_config\": {\"look_angle_deg\": " << ep_->vlm_look_angle_deg_
+                  << ", \"max_scan_steps\": " << ep_->vlm_max_scan_steps_
+                  << ", \"default_uncertain_turn\": \""
+                  << jsonEscape(ep_->vlm_default_uncertain_turn_) << "\"},\n";
+  candidates_file << "  \"panorama_views\": [\n";
+  for (size_t i = 0; i < vlm_scan_panorama_views_.size(); ++i) {
+    const auto& view = vlm_scan_panorama_views_[i];
+    candidates_file << "    {\"view_id\": \"" << jsonEscape(view.view_id)
+                    << "\", \"view_index\": " << view.view_index
+                    << ", \"scan_action_count\": " << view.init_action_count
+                    << ", \"relative_yaw_deg\": " << view.relative_yaw_deg
+                    << ", \"yaw\": " << view.yaw
+                    << ", \"robot\": {\"x\": " << view.robot(0)
+                    << ", \"y\": " << view.robot(1) << "}"
+                    << ", \"raw_image\": \"" << jsonEscape(view.raw_image_path)
+                    << "\", \"depth_image\": ";
+    if (view.depth_image_path.empty())
+      candidates_file << "null";
+    else
+      candidates_file << "\"" << jsonEscape(view.depth_image_path) << "\"";
+    candidates_file << ", \"candidate_count\": " << view.candidates.size() << "}";
+    if (i + 1 < vlm_scan_panorama_views_.size())
+      candidates_file << ",";
+    candidates_file << "\n";
+  }
+  candidates_file << "  ],\n";
+  candidates_file << "  \"scan_context\": {\"active\": "
+                  << (vlm_scan_context_active_ ? "true" : "false")
+                  << ", \"scan_count\": " << vlm_scan_count_
+                  << ", \"cumulative_angle_deg\": " << vlm_cumulative_scan_angle_deg_
+                  << ", \"last_action\": ";
+  if (vlm_scan_last_action_.empty())
+    candidates_file << "null";
+  else
+    candidates_file << "\"" << jsonEscape(vlm_scan_last_action_) << "\"";
+  candidates_file << ", \"last_reason\": ";
+  if (vlm_scan_last_reason_.empty())
+    candidates_file << "null";
+  else
+    candidates_file << "\"" << jsonEscape(vlm_scan_last_reason_) << "\"";
+  candidates_file << ", \"inspected_views\": [";
+  for (size_t i = 0; i < vlm_inspected_views_json_.size(); ++i) {
+    candidates_file << vlm_inspected_views_json_[i];
+    if (i + 1 < vlm_inspected_views_json_.size())
+      candidates_file << ", ";
+  }
+  candidates_file << "]},\n";
+  candidates_file << "  \"candidates\": [\n";
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    const auto& c = candidates[i];
+    string view_id = "";
+    double view_angle = 0.0;
+    int view_index = -1;
+    for (const auto& view : vlm_scan_panorama_views_) {
+      bool found = false;
+      for (const auto& view_candidate : view.candidates) {
+        if (view_candidate.id == c.id) {
+          view_id = view.view_id;
+          view_angle = view.relative_yaw_deg;
+          view_index = view.view_index;
+          found = true;
+          break;
+        }
+      }
+      if (found)
+        break;
+    }
+    candidates_file << "    {\"id\": \"" << jsonEscape(c.id) << "\", \"label\": \""
+                    << jsonEscape(c.label.empty() ? c.id : c.label)
+                    << "\", \"view_id\": \"" << jsonEscape(view_id)
+                    << "\", \"view_index\": " << view_index
+                    << ", \"view_angle_deg\": " << view_angle
+                    << ", \"source\": \"" << jsonEscape(c.source)
+                    << "\", \"map\": [" << c.map_position(0) << ", " << c.map_position(1)
+                    << "], \"safe_goal\": [" << c.safe_goal(0) << ", " << c.safe_goal(1)
+                    << "], \"theta_deg\": " << c.theta_deg
+                    << ", \"distance\": " << c.euclidean_distance
+                    << ", \"path_length\": " << c.path_length
+                    << ", \"path_ratio\": " << c.path_ratio
+                    << ", \"score\": " << c.score
+                    << ", \"free_distance\": " << c.free_distance
+                    << ", \"sampled_ray_count\": " << c.sampled_ray_count
+                    << ", \"direction\": \"" << jsonEscape(c.direction)
+                    << "\", \"reachable\": " << (c.reachable ? "true" : "false")
+                    << ", \"valid\": " << (c.valid ? "true" : "false")
+                    << ", \"reject_reason\": \"" << jsonEscape(c.reject_reason)
+                    << "\", \"frontier_size\": " << c.frontier_size
+                    << ", \"clearance\": " << c.clearance
+                    << ", \"visited_recently\": "
+                    << (c.recently_selected ? "true" : "false")
+                    << ", \"projection\": ";
+    if (c.has_projection)
+      candidates_file << "[" << c.image_u << ", " << c.image_v << "]";
+    else
+      candidates_file << "null";
+    candidates_file << ", \"projected_depth\": " << c.projected_depth
+                    << ", \"projection_type\": \"" << jsonEscape(c.projection_type)
+                    << "\", \"projection_proxy\": "
+                    << (c.projection_proxy ? "true" : "false")
+                    << ", \"projection_proxy_depth\": "
+                    << c.projection_proxy_depth << "}";
+    if (i + 1 < candidates.size())
+      candidates_file << ",";
+    candidates_file << "\n";
+  }
+  candidates_file << "  ]\n";
+  candidates_file << "}\n";
+  candidates_file.close();
+
+  const string image_arg = vlm_scan_panorama_views_.front().raw_image_path;
+  string command = ep_->vlm_python_executable_ + " " + shellQuote(ep_->vlm_selector_script_) +
+                   " --candidate-json " + shellQuote(candidate_json_path) + " --image " +
+                   shellQuote(image_arg) + " --output-json " + shellQuote(result_json_path) +
+                   " --target " + shellQuote(target_label_) + " --episode " +
+                   std::to_string(episode_index_) + " --step " +
+                   std::to_string(vlm_request_counter_) +
+                   " --mode vlm_scan_full_circle_choice";
+
+  const int ret = std::system(command.c_str());
+  std::ifstream result_file(result_json_path);
+  if (!result_file.is_open()) {
+    decision.fallback = true;
+    decision.fallback_reason = ret == 0 ? "vlm_result_missing" : "vlm_selector_failed";
+    return false;
+  }
+
+  std::stringstream buffer;
+  buffer << result_file.rdbuf();
+  const string raw_response = buffer.str();
+  if (!parseVLMDecision(raw_response, decision)) {
+    decision.fallback = true;
+    decision.fallback_reason =
+        decision.fallback_reason.empty() ? "invalid_vlm_json" : decision.fallback_reason;
+    return false;
+  }
+  decision.raw_response = raw_response;
+
+  if (decision.fallback)
+    return false;
+  if (decision.decision != "SELECT_WAYPOINT") {
+    decision.fallback = true;
+    decision.fallback_reason = "full_scan_requires_select_waypoint";
+    return false;
+  }
+
+  for (const auto& candidate : candidates) {
+    if (candidate.id == decision.selected_id && candidate.reachable && candidate.has_projection) {
+      selected = candidate;
+      return true;
+    }
+  }
+
+  decision.fallback = true;
+  decision.fallback_reason = "invalid_or_unprojected_selected_scan_panorama_waypoint";
+  return false;
+}
+
+bool ExplorationManager::selectWaypointWithInitialPanoramaOracle(const string& request_id,
+    const Vector2d& cur_pos, double cur_yaw, vector<VLMWaypointCandidate>& candidates,
+    VLMDecisionResult& decision, VLMWaypointCandidate& selected)
+{
+  decision = VLMDecisionResult();
+  decision.decision = "SELECT_WAYPOINT";
+  decision.front_scene_type = "frontier_oracle_initial_panorama";
+  decision.confidence = 1.0;
+  candidates.clear();
+
+  for (const auto& view : vlm_initial_panorama_views_) {
+    for (const auto& candidate : view.candidates) {
+      if (candidate.reachable && candidate.has_projection)
+        candidates.push_back(candidate);
+    }
+  }
+
+  auto normalizeAngle = [](double angle) {
+    while (angle > M_PI) angle -= 2.0 * M_PI;
+    while (angle <= -M_PI) angle += 2.0 * M_PI;
+    return angle;
+  };
+
+  auto setOracleScanDecisionFromGTPath = [&](const string& base_reason) {
+    decision.selected_id.clear();
+    decision.decision = "LOOK_LEFT_60";
+
+    bool have_gt_path_bearing = false;
+    double bearing_deg = 0.0;
+    if (oracle_have_gt_path_hint_ && std::isfinite(oracle_lookahead_point_(0)) &&
+        std::isfinite(oracle_lookahead_point_(1))) {
+      const Vector2d to_lookahead = oracle_lookahead_point_ - cur_pos;
+      if (to_lookahead.norm() > 1e-3) {
+        const double bearing =
+            normalizeAngle(std::atan2(to_lookahead(1), to_lookahead(0)) - cur_yaw);
+        bearing_deg = bearing * 180.0 / M_PI;
+        decision.decision = bearing_deg >= 0.0 ? "LOOK_LEFT_60" : "LOOK_RIGHT_60";
+        oracle_scan_direction_hint_ = decision.decision;
+        oracle_scan_direction_source_ = "gt_path_lookahead";
+        oracle_lookahead_bearing_deg_ = bearing_deg;
+        have_gt_path_bearing = true;
+      }
+    }
+
+    bool have_target_bearing = false;
+    double target_bearing_deg = 0.0;
+    if (!have_gt_path_bearing && critic_have_target_position_) {
+      const double target_bearing =
+          normalizeAngle(std::atan2(critic_target_position_(1) - cur_pos(1),
+                             critic_target_position_(0) - cur_pos(0)) -
+              cur_yaw);
+      target_bearing_deg = target_bearing * 180.0 / M_PI;
+      decision.decision = target_bearing_deg >= 0.0 ? "LOOK_LEFT_60" : "LOOK_RIGHT_60";
+      oracle_scan_direction_hint_ = decision.decision;
+      oracle_scan_direction_source_ = "target_bearing_fallback";
+      oracle_lookahead_bearing_deg_ = target_bearing_deg;
+      have_target_bearing = true;
+    }
+
+    std::ostringstream reason;
+    reason << std::fixed << std::setprecision(3) << base_reason << "; ";
+    if (have_gt_path_bearing) {
+      reason << "initial panorama had no selectable waypoint; private GT shortest-path "
+             << "lookahead bearing=" << bearing_deg
+             << " deg relative to current yaw, choosing " << decision.decision << ".";
+    }
+    else if (have_target_bearing) {
+      reason << "private GT path lookahead unavailable; fallback target bearing="
+             << target_bearing_deg << " deg relative to current yaw, choosing "
+             << decision.decision << ".";
+    }
+    else {
+      oracle_scan_direction_hint_ = decision.decision;
+      oracle_scan_direction_source_ = "default_left";
+      reason << "private GT path and target direction unavailable, defaulting to LOOK_LEFT_60.";
+    }
+    decision.reason = reason.str();
+  };
+
+  if (candidates.empty()) {
+    requestFrontierOracleScores(request_id, cur_pos, candidates);
+    setOracleScanDecisionFromGTPath(
+        "Initial-panorama frontier oracle found no visible reachable waypoint candidates in P1-P6");
+    writeFrontierOraclePanoramaLogAndImages(
+        request_id, cur_pos, cur_yaw, candidates, {}, "", decision.reason);
+    return true;
+  }
+
+  vector<FrontierOracleCandidateScore> scores =
+      requestFrontierOracleScores(request_id, cur_pos, candidates);
+
+  auto finiteDistance = [](double value) {
+    return std::isfinite(value) && value < 1e8;
+  };
+  auto isDownstairsRejected = [&](const FrontierOracleCandidateScore& score) {
+    return ep_->oracle_frontier_reject_downstairs_ &&
+        (score.downstairs_path || score.stairwell_path);
+  };
+  auto blockInitialPanoramaDownstairs = [&](const string& base_reason) {
+    oracle_frontier_blocked_downstairs_ = true;
+    decision.selected_id.clear();
+    decision.decision = "BLOCKED_DOWNSTAIRS";
+    std::ostringstream reason;
+    reason << std::fixed << std::setprecision(3) << base_reason
+           << "; no-downstairs constraint active, max_allowed_downward_drop="
+           << ep_->oracle_frontier_max_downward_drop_m_
+           << ", target_path_downward_drop=" << oracle_target_path_downward_drop_
+           << ", target_path_endpoint_height_delta="
+           << oracle_target_path_endpoint_height_delta_
+           << ". Stop this decision because every executable first waypoint would go downstairs.";
+    decision.reason = reason.str();
+    writeFrontierOraclePanoramaLogAndImages(
+        request_id, cur_pos, cur_yaw, candidates, scores, "", decision.reason);
+    return true;
+  };
+
+  int downstairs_candidate_count = 0;
+  for (const auto& score : scores) {
+    if (isDownstairsRejected(score))
+      ++downstairs_candidate_count;
+  }
+  if (!scores.empty() && downstairs_candidate_count == static_cast<int>(scores.size())) {
+    return blockInitialPanoramaDownstairs(
+        "Initial-panorama oracle rejected every P1-P6 candidate because each current->candidate executable path enters downstairs/stairwell geometry");
+  }
+
+  int gt_path_metric_count = 0;
+  int qualified_gt_path_count = 0;
+  for (const auto& score : scores) {
+    if (isDownstairsRejected(score))
+      continue;
+    if (!score.gt_path_available)
+      continue;
+    ++gt_path_metric_count;
+    if (score.endpoint_to_gt_path <= ep_->oracle_frontier_gt_path_deviation_threshold_ &&
+        score.gt_path_progress >= ep_->oracle_frontier_min_gt_path_progress_to_select_)
+      ++qualified_gt_path_count;
+  }
+
+  int best_idx = -1;
+  bool selected_initial_panorama_interior_sample = false;
+  auto betterGtPathCandidate = [&](int lhs, int rhs) {
+    if (rhs < 0)
+      return true;
+    const auto& a = scores[lhs];
+    const auto& b = scores[rhs];
+
+    const bool a_success =
+        finiteDistance(a.candidate_to_target) &&
+        a.candidate_to_target <= ep_->oracle_frontier_success_distance_;
+    const bool b_success =
+        finiteDistance(b.candidate_to_target) &&
+        b.candidate_to_target <= ep_->oracle_frontier_success_distance_;
+    if (a_success != b_success)
+      return a_success;
+
+    if (a.remaining_stairwell_path != b.remaining_stairwell_path)
+      return !a.remaining_stairwell_path;
+    if (a.remaining_downstairs_path != b.remaining_downstairs_path)
+      return !a.remaining_downstairs_path;
+    if (std::fabs(a.gt_path_progress - b.gt_path_progress) > 0.25)
+      return a.gt_path_progress > b.gt_path_progress;
+    if (std::fabs(a.progress_per_cost - b.progress_per_cost) > 0.05)
+      return a.progress_per_cost > b.progress_per_cost;
+    if (std::fabs(a.remaining_path_stairwell_drop - b.remaining_path_stairwell_drop) > 1e-3)
+      return a.remaining_path_stairwell_drop < b.remaining_path_stairwell_drop;
+    if (std::fabs(a.remaining_path_downward_drop - b.remaining_path_downward_drop) > 1e-3)
+      return a.remaining_path_downward_drop < b.remaining_path_downward_drop;
+    if (std::fabs(a.endpoint_to_gt_path - b.endpoint_to_gt_path) > 1e-3)
+      return a.endpoint_to_gt_path < b.endpoint_to_gt_path;
+    if (std::fabs(a.candidate_to_target - b.candidate_to_target) > 1e-3)
+      return a.candidate_to_target < b.candidate_to_target;
+    if (std::fabs(candidates[lhs].path_length - candidates[rhs].path_length) > 1e-3)
+      return candidates[lhs].path_length < candidates[rhs].path_length;
+    return candidates[lhs].id < candidates[rhs].id;
+  };
+
+  auto betterFallbackCandidate = [&](int lhs, int rhs) {
+    if (rhs < 0)
+      return true;
+    const auto& a = scores[lhs];
+    const auto& b = scores[rhs];
+
+    const bool a_success =
+        finiteDistance(a.candidate_to_target) &&
+        a.candidate_to_target <= ep_->oracle_frontier_success_distance_;
+    const bool b_success =
+        finiteDistance(b.candidate_to_target) &&
+        b.candidate_to_target <= ep_->oracle_frontier_success_distance_;
+    if (a_success != b_success)
+      return a_success;
+
+    if (a.remaining_stairwell_path != b.remaining_stairwell_path)
+      return !a.remaining_stairwell_path;
+    if (a.remaining_downstairs_path != b.remaining_downstairs_path)
+      return !a.remaining_downstairs_path;
+    if (std::fabs(a.remaining_path_stairwell_drop - b.remaining_path_stairwell_drop) > 1e-3)
+      return a.remaining_path_stairwell_drop < b.remaining_path_stairwell_drop;
+    if (std::fabs(a.remaining_path_downward_drop - b.remaining_path_downward_drop) > 1e-3)
+      return a.remaining_path_downward_drop < b.remaining_path_downward_drop;
+    if (std::fabs(a.total_geodesic - b.total_geodesic) > 1e-3)
+      return a.total_geodesic < b.total_geodesic;
+    if (std::fabs(a.candidate_to_target - b.candidate_to_target) > 1e-3)
+      return a.candidate_to_target < b.candidate_to_target;
+    return candidates[lhs].path_length < candidates[rhs].path_length;
+  };
+
+  if (gt_path_metric_count > 0) {
+    double best_qualified_progress = -std::numeric_limits<double>::infinity();
+    int best_interior_sample_idx = -1;
+    for (int i = 0; i < static_cast<int>(candidates.size()); ++i) {
+      const auto& score = scores[i];
+      if (isDownstairsRejected(score))
+        continue;
+      if (!score.gt_path_available)
+        continue;
+      const bool qualified =
+          score.endpoint_to_gt_path <= ep_->oracle_frontier_gt_path_deviation_threshold_ &&
+          score.gt_path_progress >= ep_->oracle_frontier_min_gt_path_progress_to_select_;
+      if (qualified_gt_path_count > 0 && !qualified)
+        continue;
+      best_qualified_progress = std::max(best_qualified_progress, score.gt_path_progress);
+      if (candidates[i].source == "frontier_cluster_sample" &&
+          betterGtPathCandidate(i, best_interior_sample_idx))
+        best_interior_sample_idx = i;
+      if (betterGtPathCandidate(i, best_idx))
+        best_idx = i;
+    }
+    if (best_interior_sample_idx >= 0 && std::isfinite(best_qualified_progress) &&
+        scores[best_interior_sample_idx].gt_path_progress >=
+            0.70 * std::max(best_qualified_progress,
+                       ep_->oracle_frontier_min_gt_path_progress_to_select_)) {
+      best_idx = best_interior_sample_idx;
+      selected_initial_panorama_interior_sample = true;
+    }
+  }
+
+  if (best_idx < 0) {
+    int finite_score_count = 0;
+    int nonnegative_progress_count = 0;
+    for (const auto& score : scores) {
+      if (isDownstairsRejected(score))
+        continue;
+      if (!finiteDistance(score.total_geodesic))
+        continue;
+      ++finite_score_count;
+      if (score.target_progress >= ep_->oracle_frontier_min_progress_to_select_)
+        ++nonnegative_progress_count;
+    }
+    for (int i = 0; i < static_cast<int>(candidates.size()); ++i) {
+      if (isDownstairsRejected(scores[i]))
+        continue;
+      if (!finiteDistance(scores[i].total_geodesic))
+        continue;
+      if (nonnegative_progress_count > 0 &&
+          scores[i].target_progress < ep_->oracle_frontier_min_progress_to_select_)
+        continue;
+      if (betterFallbackCandidate(i, best_idx))
+        best_idx = i;
+    }
+  }
+
+  if (best_idx < 0) {
+    for (int i = 0; i < static_cast<int>(candidates.size()); ++i) {
+      if (i < static_cast<int>(scores.size()) && isDownstairsRejected(scores[i]))
+        continue;
+      if (best_idx < 0 || candidates[i].path_length < candidates[best_idx].path_length)
+        best_idx = i;
+    }
+    if (best_idx < 0)
+      return blockInitialPanoramaDownstairs(
+          "Initial-panorama oracle has no non-downstairs fallback candidate");
+    decision.reason =
+        "Initial-panorama frontier oracle scores unavailable; selected shortest executable P1-P6 waypoint.";
+  }
+  else if (scores[best_idx].gt_path_available) {
+    std::ostringstream reason;
+    reason << std::fixed << std::setprecision(3)
+           << "Initial-panorama frontier oracle selected " << candidates[best_idx].id
+           << " from the P1-P6 scanned waypoint set; endpoint_to_gt_path="
+           << scores[best_idx].endpoint_to_gt_path
+           << ", gt_path_progress=" << scores[best_idx].gt_path_progress
+           << ", progress_per_cost=" << scores[best_idx].progress_per_cost
+           << ", current_to_candidate=" << scores[best_idx].current_to_candidate
+           << ", remaining_to_target=" << scores[best_idx].candidate_to_target
+           << ", path_downward_drop=" << scores[best_idx].path_downward_drop
+           << ", endpoint_height_delta=" << scores[best_idx].endpoint_height_delta
+           << ", path_stairwell_drop=" << scores[best_idx].path_stairwell_drop
+           << ", remaining_path_downward_drop="
+           << scores[best_idx].remaining_path_downward_drop
+           << ", remaining_endpoint_height_delta="
+           << scores[best_idx].remaining_endpoint_height_delta
+           << ", remaining_path_stairwell_drop="
+           << scores[best_idx].remaining_path_stairwell_drop
+           << ", source=" << scores[best_idx].source
+           << (selected_initial_panorama_interior_sample
+                   ? ", learnable_interior_sample=true"
+                   : "")
+           << ". Selection is constrained to visible/reachable waypoints from the initial scan.";
+    decision.reason = reason.str();
+  }
+  else {
+    std::ostringstream reason;
+    reason << std::fixed << std::setprecision(3)
+           << "Initial-panorama frontier oracle selected " << candidates[best_idx].id
+           << " from the P1-P6 scanned waypoint set with fallback current->candidate->target "
+           << "geodesic ranking; total=" << scores[best_idx].total_geodesic
+           << ", remaining_to_target=" << scores[best_idx].candidate_to_target
+           << ", progress=" << scores[best_idx].target_progress
+           << ", source=" << scores[best_idx].source << ".";
+    decision.reason = reason.str();
+  }
+
+  selected = candidates[best_idx];
+  decision.selected_id = selected.id;
+  writeFrontierOraclePanoramaLogAndImages(
+      request_id, cur_pos, cur_yaw, candidates, scores, selected.id, decision.reason);
+  return true;
+}
+
+bool ExplorationManager::isVLMForcedLookDecision(const string& decision) const
+{
+  return decision == "LOOK_LEFT_60" || decision == "LOOK_RIGHT_60";
+}
+
+void ExplorationManager::updateVLMScanContext(const VLMDecisionResult& decision, int visible_candidate_count)
+{
+  const double current_view_angle = vlm_cumulative_scan_angle_deg_;
+  const string analysis_json =
+      decision.candidate_analysis_json.empty() ? string("[]") : decision.candidate_analysis_json;
+
+  std::ostringstream view;
+  view << std::fixed << std::setprecision(1);
+  view << "{\"relative_angle_deg\": " << current_view_angle << ", \"action\": \""
+       << jsonEscape(decision.decision) << "\", \"front_scene_type\": \""
+       << jsonEscape(decision.front_scene_type) << "\", \"candidate_count\": "
+       << visible_candidate_count << ", \"reason\": \""
+       << jsonEscape(decision.reason) << "\", \"candidate_analysis\": " << analysis_json << "}";
+  vlm_inspected_views_json_.push_back(view.str());
+
+  vlm_scan_context_active_ = true;
+  vlm_scan_count_++;
+  const double turn_delta =
+      decision.decision == "LOOK_LEFT_60" ? ep_->vlm_look_angle_deg_ : -ep_->vlm_look_angle_deg_;
+  vlm_cumulative_scan_angle_deg_ += turn_delta;
+  vlm_scan_last_action_ = decision.decision;
+  vlm_scan_last_reason_ = decision.reason;
+}
+
+void ExplorationManager::setPendingVLMForcedTurn(const string& decision)
+{
+  pending_vlm_forced_action_ =
+      decision == "LOOK_RIGHT_60" ? kActionTurnRight : kActionTurnLeft;
+  pending_vlm_forced_action_steps_ = std::max(1,
+      static_cast<int>(std::round(std::fabs(ep_->vlm_look_angle_deg_) / kDiscreteTurnAngleDeg)));
+  ROS_WARN("[VLM Scan] Queue %d forced turn step(s) for %s",
+      pending_vlm_forced_action_steps_, decision.c_str());
+}
+
+bool ExplorationManager::selectWaypointWithVLM(const string& request_id, const Vector2d& cur_pos,
+    double cur_yaw, const vector<VLMWaypointCandidate>& candidates, VLMDecisionResult& decision,
+    VLMWaypointCandidate& selected)
+{
+  decision = VLMDecisionResult();
+
+  const string image_dir = ep_->vlm_debug_dir_ + "/vlm_waypoints";
+  const string log_dir = ep_->vlm_debug_dir_ + "/vlm_waypoint_logs";
+  const int image_dir_status = std::system(("mkdir -p " + shellQuote(image_dir)).c_str());
+  const int log_dir_status = std::system(("mkdir -p " + shellQuote(log_dir)).c_str());
+  if (image_dir_status != 0 || log_dir_status != 0) {
+    decision.fallback = true;
+    decision.fallback_reason = "debug_directory_create_failed";
+    return false;
+  }
+
+  const string raw_image_path = image_dir + "/" + request_id + "_raw.png";
+  const string raw_depth_path = image_dir + "/" + request_id + "_depth.png";
+  const string candidate_json_path = log_dir + "/" + request_id + "_candidates.json";
+  const string result_json_path = log_dir + "/" + request_id + "_vlm_result.json";
+
+  string image_error;
+  if (!saveLatestRGBImage(raw_image_path, image_error)) {
+    decision.fallback = true;
+    decision.fallback_reason = image_error;
+    return false;
+  }
+
+  string depth_error;
+  const bool saved_depth_image = saveLatestDepthImage(raw_depth_path, depth_error);
+  if (!saved_depth_image)
+    ROS_WARN_THROTTLE(2.0, "[VLM Waypoint] Depth overlay unavailable: %s", depth_error.c_str());
+
+  std::ofstream candidates_file(candidate_json_path);
+  if (!candidates_file.is_open()) {
+    decision.fallback = true;
+    decision.fallback_reason = "candidate_json_open_failed";
+    return false;
+  }
+
+  candidates_file << std::fixed << std::setprecision(4);
+  candidates_file << "{\n";
+  candidates_file << "  \"target\": \"" << jsonEscape(target_label_) << "\",\n";
+  candidates_file << "  \"episode\": " << episode_index_ << ",\n";
+  candidates_file << "  \"step\": " << vlm_request_counter_ << ",\n";
+  candidates_file << "  \"mode\": \"vlm_guided_geometric\",\n";
+  candidates_file << "  \"robot\": {\"x\": " << cur_pos(0) << ", \"y\": " << cur_pos(1)
+                  << ", \"yaw\": " << cur_yaw << "},\n";
+  writeVLMDetectorSemanticMapSnapshot(candidates_file, cur_pos, cur_yaw);
+  writeVLMMetricMapSummary(candidates_file);
+  candidates_file << "  \"vlm_config\": {\"look_angle_deg\": " << ep_->vlm_look_angle_deg_
+                  << ", \"max_scan_steps\": " << ep_->vlm_max_scan_steps_
+                  << ", \"default_uncertain_turn\": \""
+                  << jsonEscape(ep_->vlm_default_uncertain_turn_)
+                  << "\", \"min_candidate_clearance_m\": "
+                  << ep_->vlm_min_candidate_clearance_m_
+                  << ", \"scan_reject_candidate_radius\": "
+                  << ep_->vlm_scan_reject_candidate_radius_
+                  << ", \"local_view_enabled\": "
+                  << (ep_->vlm_use_local_view_candidates_ ? "true" : "false")
+                  << ", \"max_candidate_path_ratio\": "
+                  << ep_->vlm_max_candidate_path_ratio_
+                  << ", \"local_view_hfov_deg\": " << ep_->vlm_local_view_hfov_deg_
+                  << ", \"local_view_rays_per_sector\": " << ep_->vlm_local_view_rays_per_sector_
+                  << ", \"local_view_min_candidate_dist\": " << ep_->vlm_local_view_min_candidate_dist_
+                  << ", \"local_view_preferred_candidate_dist\": "
+                  << ep_->vlm_local_view_preferred_candidate_dist_
+                  << ", \"local_view_max_candidate_dist\": " << ep_->vlm_local_view_max_candidate_dist_
+                  << ", \"local_view_min_clearance\": " << ep_->vlm_local_view_min_clearance_
+                  << "},\n";
+  candidates_file << "  \"scan_context\": {\"active\": "
+                  << (vlm_scan_context_active_ ? "true" : "false")
+                  << ", \"scan_count\": " << vlm_scan_count_
+                  << ", \"cumulative_angle_deg\": " << vlm_cumulative_scan_angle_deg_
+                  << ", \"last_action\": ";
+  if (vlm_scan_last_action_.empty())
+    candidates_file << "null";
+  else
+    candidates_file << "\"" << jsonEscape(vlm_scan_last_action_) << "\"";
+  candidates_file << ", \"last_reason\": ";
+  if (vlm_scan_last_reason_.empty())
+    candidates_file << "null";
+  else
+    candidates_file << "\"" << jsonEscape(vlm_scan_last_reason_) << "\"";
+  candidates_file << ", \"inspected_views\": [";
+  for (size_t i = 0; i < vlm_inspected_views_json_.size(); ++i) {
+    candidates_file << vlm_inspected_views_json_[i];
+    if (i + 1 < vlm_inspected_views_json_.size())
+      candidates_file << ", ";
+  }
+  candidates_file << "]},\n";
+  candidates_file << "  \"candidate_filtering\": {\"vlm_scan_reject_candidate_radius\": "
+                  << ep_->vlm_scan_reject_candidate_radius_
+                  << ", \"vlm_min_candidate_clearance_m\": "
+                  << ep_->vlm_min_candidate_clearance_m_
+                  << ", \"vlm_max_candidate_path_ratio\": "
+                  << ep_->vlm_max_candidate_path_ratio_
+                  << ", \"before_clearance_filter\": "
+                  << vlm_last_candidate_count_before_clearance_filter_
+                  << ", \"after_clearance_filter\": "
+                  << vlm_last_candidate_count_after_clearance_filter_
+                  << ", \"before_path_ratio_filter\": "
+                  << vlm_last_candidate_count_before_path_ratio_filter_
+                  << ", \"after_path_ratio_filter\": "
+                  << vlm_last_candidate_count_after_path_ratio_filter_
+                  << ", \"before_scan_reject_filter\": "
+                  << vlm_last_candidate_count_before_scan_reject_filter_
+                  << ", \"after_scan_reject_filter\": "
+                  << vlm_last_candidate_count_after_scan_reject_filter_
+                  << ", \"filtered_low_clearance\": [\n";
+  for (size_t i = 0; i < vlm_last_low_clearance_filtered_candidates_.size(); ++i) {
+    const auto& c = vlm_last_low_clearance_filtered_candidates_[i];
+    candidates_file << "    {\"id\": \"" << jsonEscape(c.id) << "\", \"source\": \""
+                    << jsonEscape(c.source) << "\", \"safe_goal_xy\": [" << c.safe_goal(0)
+                    << ", " << c.safe_goal(1) << "], \"raw_frontier_xy\": ["
+                    << c.map_position(0) << ", " << c.map_position(1)
+                    << "], \"clearance\": " << c.clearance
+                    << ", \"filtered_reason\": \"" << jsonEscape(c.filtered_reason) << "\"}";
+    if (i + 1 < vlm_last_low_clearance_filtered_candidates_.size())
+      candidates_file << ",";
+    candidates_file << "\n";
+  }
+  candidates_file << "  ], \"filtered_high_path_ratio_candidates\": [\n";
+  for (size_t i = 0; i < vlm_last_high_path_ratio_filtered_candidates_.size(); ++i) {
+    const auto& c = vlm_last_high_path_ratio_filtered_candidates_[i];
+    candidates_file << "    {\"id\": \"" << jsonEscape(c.id) << "\", \"source\": \""
+                    << jsonEscape(c.source) << "\", \"safe_goal_xy\": [" << c.safe_goal(0)
+                    << ", " << c.safe_goal(1) << "], \"raw_frontier_xy\": ["
+                    << c.map_position(0) << ", " << c.map_position(1)
+                    << "], \"distance\": " << c.euclidean_distance
+                    << ", \"path_length\": " << c.path_length
+                    << ", \"path_ratio\": " << c.path_ratio
+                    << ", \"clearance\": " << c.clearance
+                    << ", \"filtered_reason\": \"" << jsonEscape(c.filtered_reason) << "\"}";
+    if (i + 1 < vlm_last_high_path_ratio_filtered_candidates_.size())
+      candidates_file << ",";
+    candidates_file << "\n";
+  }
+  candidates_file << "  ], \"filtered_near_unselected_candidates\": [\n";
+  for (size_t i = 0; i < vlm_last_scan_rejected_filtered_candidates_.size(); ++i) {
+    const auto& c = vlm_last_scan_rejected_filtered_candidates_[i];
+    candidates_file << "    {\"id\": \"" << jsonEscape(c.id) << "\", \"source\": \""
+                    << jsonEscape(c.source) << "\", \"safe_goal_xy\": [" << c.safe_goal(0)
+                    << ", " << c.safe_goal(1) << "], \"raw_frontier_xy\": ["
+                    << c.map_position(0) << ", " << c.map_position(1)
+                    << "], \"clearance\": " << c.clearance
+                    << ", \"filtered_reason\": \"" << jsonEscape(c.filtered_reason) << "\"}";
+    if (i + 1 < vlm_last_scan_rejected_filtered_candidates_.size())
+      candidates_file << ",";
+    candidates_file << "\n";
+  }
+  candidates_file << "  ], \"filtered_local_view_candidates\": [\n";
+  for (size_t i = 0; i < vlm_last_local_view_rejected_candidates_.size(); ++i) {
+    const auto& c = vlm_last_local_view_rejected_candidates_[i];
+    candidates_file << "    {\"id\": \"" << jsonEscape(c.id) << "\", \"label\": \""
+                    << jsonEscape(c.label) << "\", \"source\": \""
+                    << jsonEscape(c.source) << "\", \"theta_deg\": " << c.theta_deg
+                    << ", \"distance\": " << c.euclidean_distance
+                    << ", \"free_distance\": " << c.free_distance
+                    << ", \"sampled_ray_count\": " << c.sampled_ray_count
+                    << ", \"safe_goal_xy\": [" << c.safe_goal(0) << ", " << c.safe_goal(1)
+                    << "], \"clearance\": " << c.clearance
+                    << ", \"reject_reason\": \"" << jsonEscape(c.reject_reason) << "\"}";
+    if (i + 1 < vlm_last_local_view_rejected_candidates_.size())
+      candidates_file << ",";
+    candidates_file << "\n";
+  }
+  candidates_file << "  ]},\n";
+  candidates_file << "  \"candidates\": [\n";
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    const auto& c = candidates[i];
+    candidates_file << "    {\"id\": \"" << jsonEscape(c.id) << "\", \"label\": \""
+                    << jsonEscape(c.label.empty() ? c.id : c.label) << "\", \"source\": \""
+                    << jsonEscape(c.source) << "\", \"map\": [" << c.map_position(0)
+                    << ", " << c.map_position(1) << "], \"safe_goal\": [" << c.safe_goal(0)
+                    << ", " << c.safe_goal(1) << "], \"theta_deg\": " << c.theta_deg
+                    << ", \"distance\": " << c.euclidean_distance
+                    << ", \"path_length\": " << c.path_length
+                    << ", \"path_ratio\": " << c.path_ratio
+                    << ", \"score\": " << c.score
+                    << ", \"free_distance\": " << c.free_distance
+                    << ", \"sampled_ray_count\": " << c.sampled_ray_count
+                    << ", \"direction\": \"" << c.direction << "\", \"reachable\": "
+                    << (c.reachable ? "true" : "false") << ", \"valid\": "
+                    << (c.valid ? "true" : "false") << ", \"reject_reason\": \""
+                    << jsonEscape(c.reject_reason) << "\", \"frontier_size\": "
+                    << c.frontier_size << ", \"clearance\": " << c.clearance
+                    << ", \"visited_recently\": "
+                    << (c.recently_selected ? "true" : "false") << ", \"projection\": ";
+    if (c.has_projection)
+      candidates_file << "[" << c.image_u << ", " << c.image_v << "]";
+    else
+      candidates_file << "null";
+    candidates_file << ", \"projected_depth\": " << c.projected_depth
+                    << ", \"projection_type\": \"" << jsonEscape(c.projection_type) << "\""
+                    << ", \"projection_proxy\": "
+                    << (c.projection_proxy ? "true" : "false")
+                    << ", \"projection_proxy_depth\": "
+                    << c.projection_proxy_depth << "}";
+    if (i + 1 < candidates.size())
+      candidates_file << ",";
+    candidates_file << "\n";
+  }
+  candidates_file << "  ]\n";
+  candidates_file << "}\n";
+  candidates_file.close();
+
+  string command = ep_->vlm_python_executable_ + " " + shellQuote(ep_->vlm_selector_script_) +
+                   " --candidate-json " + shellQuote(candidate_json_path) + " --image " +
+                   shellQuote(raw_image_path) + " --output-json " + shellQuote(result_json_path) +
+                   " --target " + shellQuote(target_label_) + " --episode " +
+                   std::to_string(episode_index_) + " --step " +
+                   std::to_string(vlm_request_counter_) + " --mode vlm_guided_geometric";
+  if (saved_depth_image)
+    command += " --depth-image " + shellQuote(raw_depth_path);
+
+  const int ret = std::system(command.c_str());
+  std::ifstream result_file(result_json_path);
+  if (!result_file.is_open()) {
+    decision.fallback = true;
+    decision.fallback_reason = ret == 0 ? "vlm_result_missing" : "vlm_selector_failed";
+    return false;
+  }
+  std::stringstream buffer;
+  buffer << result_file.rdbuf();
+  const string raw_response = buffer.str();
+
+  if (!parseVLMDecision(raw_response, decision)) {
+    decision.fallback = true;
+    decision.fallback_reason =
+        decision.fallback_reason.empty() ? "invalid_vlm_json" : decision.fallback_reason;
+    return false;
+  }
+  decision.raw_response = raw_response;
+
+  if (decision.fallback)
+    return false;
+
+  if (isVLMForcedLookDecision(decision.decision))
+    return true;
+
+  if (decision.decision != "SELECT_WAYPOINT") {
+    decision.fallback = true;
+    decision.fallback_reason = "unknown_decision";
+    return false;
+  }
+
+  for (const auto& candidate : candidates) {
+    if (candidate.id == decision.selected_id && candidate.reachable && candidate.has_projection) {
+      selected = candidate;
+      return true;
+    }
+  }
+
+  decision.fallback = true;
+  decision.fallback_reason = "invalid_or_unprojected_selected_waypoint";
+  return false;
+}
+
+void ExplorationManager::writeVLMSelectionLog(const string& request_id,
+    const vector<VLMWaypointCandidate>& candidates, const VLMDecisionResult& decision,
+    const Vector2d& final_goal, bool fallback, const string& fallback_reason,
+    bool scan_context_reset) const
+{
+  const string log_dir = ep_->vlm_debug_dir_ + "/vlm_waypoint_logs";
+  const int log_dir_status = std::system(("mkdir -p " + shellQuote(log_dir)).c_str());
+  if (log_dir_status != 0)
+    return;
+  const string log_path = log_dir + "/" + request_id + "_planner_log.json";
+  std::ofstream log_file(log_path);
+  if (!log_file.is_open())
+    return;
+
+  log_file << std::fixed << std::setprecision(4);
+  log_file << "{\n";
+  log_file << "  \"request_id\": \"" << jsonEscape(request_id) << "\",\n";
+  log_file << "  \"target\": \"" << jsonEscape(target_label_) << "\",\n";
+  log_file << "  \"episode\": " << episode_index_ << ",\n";
+  log_file << "  \"step\": " << vlm_request_counter_ << ",\n";
+  log_file << "  \"mode\": \"vlm_guided_geometric\",\n";
+  log_file << "  \"front_scene_type\": \"" << jsonEscape(decision.front_scene_type) << "\",\n";
+  log_file << "  \"candidate_analysis\": "
+           << (decision.candidate_analysis_json.empty() ? "[]" : decision.candidate_analysis_json)
+           << ",\n";
+  log_file << "  \"decision\": \"" << jsonEscape(decision.decision) << "\",\n";
+  log_file << "  \"selected\": ";
+  if (decision.selected_id.empty())
+    log_file << "null";
+  else
+    log_file << "\"" << jsonEscape(decision.selected_id) << "\"";
+  log_file << ",\n";
+  log_file << "  \"selected_id\": \"" << jsonEscape(decision.selected_id) << "\",\n";
+  log_file << "  \"reason\": \"" << jsonEscape(decision.reason) << "\",\n";
+  int visible_candidate_count = 0;
+  for (const auto& c : candidates) {
+    if (c.reachable && c.has_projection)
+      visible_candidate_count++;
+  }
+  log_file << "  \"confidence\": " << decision.confidence << ",\n";
+  log_file << "  \"reference_assessment\": {\"label_only_enabled\": "
+           << (isOracleFrontierLabelOnlyMode() ? "true" : "false")
+           << ", \"log_dir\": \"" << jsonEscape(ep_->oracle_frontier_log_dir_)
+           << "\"},\n";
+  log_file << "  \"critical_acceptance\": {},\n";
+  log_file << "  \"visible_candidate_count\": " << visible_candidate_count << ",\n";
+  log_file << "  \"no_visible_candidates\": " << (visible_candidate_count == 0 ? "true" : "false") << ",\n";
+  log_file << "  \"vlm_fallback_reason\": \"" << jsonEscape(decision.fallback_reason) << "\",\n";
+  log_file << "  \"scan_count\": " << vlm_scan_count_ << ",\n";
+  log_file << "  \"cumulative_angle_deg\": " << vlm_cumulative_scan_angle_deg_ << ",\n";
+  log_file << "  \"scan_context_reset\": " << (scan_context_reset ? "true" : "false") << ",\n";
+  log_file << "  \"final_safe_goal\": [" << final_goal(0) << ", " << final_goal(1) << "],\n";
+  log_file << "  \"fallback\": " << (fallback ? "true" : "false") << ",\n";
+  log_file << "  \"fallback_reason\": \"" << jsonEscape(fallback_reason) << "\",\n";
+  log_file << "  \"vlm_scan_reject_candidate_radius\": "
+           << ep_->vlm_scan_reject_candidate_radius_ << ",\n";
+  log_file << "  \"vlm_min_candidate_clearance_m\": "
+           << ep_->vlm_min_candidate_clearance_m_ << ",\n";
+  log_file << "  \"vlm_max_candidate_path_ratio\": "
+           << ep_->vlm_max_candidate_path_ratio_ << ",\n";
+  log_file << "  \"candidate_count_before_clearance_filter\": "
+           << vlm_last_candidate_count_before_clearance_filter_ << ",\n";
+  log_file << "  \"candidate_count_after_clearance_filter\": "
+           << vlm_last_candidate_count_after_clearance_filter_ << ",\n";
+  log_file << "  \"filtered_low_clearance_candidates\": [\n";
+  for (size_t i = 0; i < vlm_last_low_clearance_filtered_candidates_.size(); ++i) {
+    const auto& c = vlm_last_low_clearance_filtered_candidates_[i];
+    log_file << "    {\"id\": \"" << jsonEscape(c.id) << "\", \"source\": \""
+             << jsonEscape(c.source) << "\", \"safe_goal_xy\": [" << c.safe_goal(0)
+             << ", " << c.safe_goal(1) << "], \"raw_frontier_xy\": ["
+             << c.map_position(0) << ", " << c.map_position(1)
+             << "], \"clearance\": " << c.clearance
+             << ", \"filtered_reason\": \"" << jsonEscape(c.filtered_reason) << "\"}";
+    if (i + 1 < vlm_last_low_clearance_filtered_candidates_.size())
+      log_file << ",";
+    log_file << "\n";
+  }
+  log_file << "  ],\n";
+  log_file << "  \"candidate_count_before_path_ratio_filter\": "
+           << vlm_last_candidate_count_before_path_ratio_filter_ << ",\n";
+  log_file << "  \"candidate_count_after_path_ratio_filter\": "
+           << vlm_last_candidate_count_after_path_ratio_filter_ << ",\n";
+  log_file << "  \"filtered_high_path_ratio_candidates\": [\n";
+  for (size_t i = 0; i < vlm_last_high_path_ratio_filtered_candidates_.size(); ++i) {
+    const auto& c = vlm_last_high_path_ratio_filtered_candidates_[i];
+    log_file << "    {\"id\": \"" << jsonEscape(c.id) << "\", \"source\": \""
+             << jsonEscape(c.source) << "\", \"safe_goal_xy\": [" << c.safe_goal(0)
+             << ", " << c.safe_goal(1) << "], \"raw_frontier_xy\": ["
+             << c.map_position(0) << ", " << c.map_position(1)
+             << "], \"distance\": " << c.euclidean_distance
+             << ", \"path_length\": " << c.path_length
+             << ", \"path_ratio\": " << c.path_ratio
+             << ", \"clearance\": " << c.clearance
+             << ", \"filtered_reason\": \"" << jsonEscape(c.filtered_reason) << "\"}";
+    if (i + 1 < vlm_last_high_path_ratio_filtered_candidates_.size())
+      log_file << ",";
+    log_file << "\n";
+  }
+  log_file << "  ],\n";
+  log_file << "  \"candidate_count_before_scan_reject_filter\": "
+           << vlm_last_candidate_count_before_scan_reject_filter_ << ",\n";
+  log_file << "  \"candidate_count_after_scan_reject_filter\": "
+           << vlm_last_candidate_count_after_scan_reject_filter_ << ",\n";
+  log_file << "  \"filtered_near_unselected_candidates\": [\n";
+  for (size_t i = 0; i < vlm_last_scan_rejected_filtered_candidates_.size(); ++i) {
+    const auto& c = vlm_last_scan_rejected_filtered_candidates_[i];
+    log_file << "    {\"id\": \"" << jsonEscape(c.id) << "\", \"source\": \""
+             << jsonEscape(c.source) << "\", \"safe_goal_xy\": [" << c.safe_goal(0)
+             << ", " << c.safe_goal(1) << "], \"raw_frontier_xy\": ["
+             << c.map_position(0) << ", " << c.map_position(1)
+             << "], \"clearance\": " << c.clearance
+             << ", \"filtered_reason\": \"" << jsonEscape(c.filtered_reason) << "\"}";
+    if (i + 1 < vlm_last_scan_rejected_filtered_candidates_.size())
+      log_file << ",";
+    log_file << "\n";
+  }
+  log_file << "  ],\n";
+  log_file << "  \"filtered_local_view_candidates\": [\n";
+  for (size_t i = 0; i < vlm_last_local_view_rejected_candidates_.size(); ++i) {
+    const auto& c = vlm_last_local_view_rejected_candidates_[i];
+    log_file << "    {\"id\": \"" << jsonEscape(c.id) << "\", \"label\": \""
+             << jsonEscape(c.label) << "\", \"source\": \"" << jsonEscape(c.source)
+             << "\", \"theta_deg\": " << c.theta_deg
+             << ", \"distance\": " << c.euclidean_distance
+             << ", \"free_distance\": " << c.free_distance
+             << ", \"sampled_ray_count\": " << c.sampled_ray_count
+             << ", \"safe_goal_xy\": [" << c.safe_goal(0) << ", " << c.safe_goal(1)
+             << "], \"clearance\": " << c.clearance
+             << ", \"reject_reason\": \"" << jsonEscape(c.reject_reason) << "\"}";
+    if (i + 1 < vlm_last_local_view_rejected_candidates_.size())
+      log_file << ",";
+    log_file << "\n";
+  }
+  log_file << "  ],\n";
+  log_file << "  \"raw_vlm_output\": \"" << jsonEscape(decision.raw_response) << "\",\n";
+  log_file << "  \"candidates\": [\n";
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    const auto& c = candidates[i];
+    log_file << "    {\"id\": \"" << jsonEscape(c.id) << "\", \"label\": \""
+             << jsonEscape(c.label.empty() ? c.id : c.label) << "\", \"source\": \""
+             << jsonEscape(c.source) << "\", \"map\": [" << c.map_position(0) << ", "
+             << c.map_position(1) << "], \"safe_goal\": [" << c.safe_goal(0) << ", "
+             << c.safe_goal(1) << "], \"theta_deg\": " << c.theta_deg
+             << ", \"distance\": " << c.euclidean_distance
+             << ", \"path_length\": " << c.path_length
+             << ", \"path_ratio\": " << c.path_ratio
+             << ", \"score\": " << c.score
+             << ", \"free_distance\": " << c.free_distance
+             << ", \"sampled_ray_count\": " << c.sampled_ray_count
+             << ", \"direction\": \"" << c.direction
+             << "\", \"reachable\": " << (c.reachable ? "true" : "false")
+             << ", \"valid\": " << (c.valid ? "true" : "false")
+             << ", \"reject_reason\": \"" << jsonEscape(c.reject_reason)
+             << "\", \"frontier_size\": " << c.frontier_size
+             << ", \"clearance\": " << c.clearance
+             << ", \"visited_recently\": " << (c.recently_selected ? "true" : "false")
+             << ", \"projection\": ";
+    if (c.has_projection)
+      log_file << "[" << c.image_u << ", " << c.image_v << "]";
+    else
+      log_file << "null";
+    log_file << ", \"projected_depth\": " << c.projected_depth
+             << ", \"projection_type\": \"" << jsonEscape(c.projection_type) << "\""
+             << ", \"projection_proxy\": "
+             << (c.projection_proxy ? "true" : "false")
+             << ", \"projection_proxy_depth\": "
+             << c.projection_proxy_depth << "}";
+    if (i + 1 < candidates.size())
+      log_file << ",";
+    log_file << "\n";
+  }
+  log_file << "  ]\n";
+  log_file << "}\n";
+}
+
+bool ExplorationManager::isCriticOnlyDebugMode() const
+{
+  return ep_ && ep_->reflection_mode_ == "critic_only_debug" &&
+         ep_->reflection_critic_only_debug_enabled_;
+}
+
+bool ExplorationManager::getCriticDistanceToTarget(const Vector2d& pos, double& distance,
+    string& source, vector<string>& reason_codes) const
+{
+  if (ep_->reflection_prefer_geodesic_distance_ && critic_have_geodesic_distance_) {
+    distance = critic_geodesic_distance_;
+    source = "geodesic";
+    return true;
+  }
+
+  if (ep_->reflection_prefer_geodesic_distance_ && !critic_have_geodesic_distance_)
+    reason_codes.push_back("geodesic_distance_unavailable_fallback_euclidean");
+
+  if (critic_have_target_position_) {
+    distance = (pos - critic_target_position_).norm();
+    source = "euclidean_fallback";
+    return true;
+  }
+
+  source = "unavailable";
+  reason_codes.push_back("target_distance_unavailable");
+  return false;
+}
+
+void ExplorationManager::resetCriticEpisodeStats(int episode_id)
+{
+  critic_stats_ = GTTrainingCriticEpisodeStats();
+  critic_stats_.episode_id = episode_id;
+}
+
+void ExplorationManager::startCriticDecision(const string& request_id,
+    const VLMDecisionResult& decision, const VLMWaypointCandidate* selected,
+    const Vector2d& anchor_pos, double anchor_yaw)
+{
+  if (!isCriticOnlyDebugMode()) {
+    ROS_ASSERT_MSG(!critic_pending_.active,
+        "[GTTrainingCritic] critic must not be active in normal mode");
+    return;
+  }
+  if (decision.decision.empty())
+    return;
+
+  if (critic_stats_.episode_id != episode_index_)
+    resetCriticEpisodeStats(episode_index_);
+
+  if (critic_pending_.active) {
+    ROS_WARN("[GTTrainingCritic] Replacing unfinished pending critic record request_id=%s",
+        critic_pending_.request_id.c_str());
+  }
+
+  vector<string> reason_codes;
+  double distance_before = -1.0;
+  string distance_source_before;
+  const bool have_distance_before =
+      getCriticDistanceToTarget(anchor_pos, distance_before, distance_source_before, reason_codes);
+
+  GTTrainingCriticPendingDecision pending;
+  pending.active = true;
+  pending.request_id = request_id;
+  pending.episode_id = episode_index_;
+  pending.step_id = vlm_request_counter_;
+  pending.selected_action = decision.decision;
+  pending.selected_id = decision.selected_id;
+  pending.candidate_type = selected ? selected->source :
+      (isVLMForcedLookDecision(decision.decision) ? "scan" : "unknown");
+  pending.direction_group = selected ? selected->direction : decision.decision;
+  pending.vlm_reason = decision.reason;
+  pending.confidence = decision.confidence;
+  pending.annotated_rgb_path = ep_->vlm_debug_dir_ + "/vlm_waypoints/" + request_id + "_annotated.png";
+  pending.anchor_position = anchor_pos;
+  pending.anchor_yaw = anchor_yaw;
+  pending.have_distance_before = have_distance_before;
+  pending.distance_to_target_before = have_distance_before ? distance_before : -1.0;
+  pending.distance_source_before = distance_source_before;
+  pending.scan_count = vlm_scan_count_;
+  pending.cumulative_scan_angle_deg = vlm_cumulative_scan_angle_deg_;
+
+  std::ostringstream scan_history;
+  scan_history << "[";
+  for (size_t i = 0; i < vlm_inspected_views_json_.size(); ++i) {
+    scan_history << vlm_inspected_views_json_[i];
+    if (i + 1 < vlm_inspected_views_json_.size())
+      scan_history << ", ";
+  }
+  scan_history << "]";
+  pending.scan_history_json = scan_history.str();
+
+  const string log_dir = ep_->reflection_critic_log_dir_;
+  const int mkdir_status = std::system(("mkdir -p " + shellQuote(log_dir)).c_str());
+  if (mkdir_status == 0) {
+    pending.copied_annotated_rgb_path = log_dir + "/" + request_id + "_before_annotated.png";
+    std::system(("cp -f " + shellQuote(pending.annotated_rgb_path) + " " +
+                    shellQuote(pending.copied_annotated_rgb_path)).c_str());
+  }
+
+  if (!reason_codes.empty()) {
+    ROS_WARN("[GTTrainingCritic] request=%s private anchor distance source=%s warning=%s",
+        request_id.c_str(), distance_source_before.c_str(), reason_codes.front().c_str());
+  }
+
+  critic_pending_ = pending;
+
+  if (isVLMForcedLookDecision(decision.decision)) {
+    ROS_ASSERT_MSG(critic_pending_.selected_action == "LOOK_LEFT_60" ||
+                       critic_pending_.selected_action == "LOOK_RIGHT_60",
+        "[GTTrainingCritic] scan action must be an explicit VLM look action");
+  }
+}
+
+void ExplorationManager::maybeFinalizePendingCriticDecision(
+    const Vector2d& cur_pos, const string& outcome_reason)
+{
+  if (!isCriticOnlyDebugMode()) {
+    ROS_ASSERT_MSG(!critic_pending_.active,
+        "[GTTrainingCritic] pending critic record exists while reflection mode is normal");
+    return;
+  }
+  if (!critic_pending_.active)
+    return;
+  if (!isVLMForcedLookDecision(critic_pending_.selected_action))
+    return;
+  if (isVLMForcedLookDecision(critic_pending_.selected_action) &&
+      pending_vlm_forced_action_steps_ > 0)
+    return;
+  finalizePendingCriticDecision(cur_pos, outcome_reason);
+}
+
+void ExplorationManager::finalizePendingCriticDecision(
+    const Vector2d& cur_pos, const string& outcome_reason)
+{
+  if (!isCriticOnlyDebugMode() || !critic_pending_.active)
+    return;
+
+  GTTrainingCriticPendingDecision pending = critic_pending_;
+  critic_pending_ = GTTrainingCriticPendingDecision();
+
+  string after_rgb_path;
+  string after_rgb_error;
+  const string log_dir = ep_->reflection_critic_log_dir_;
+  const int mkdir_status = std::system(("mkdir -p " + shellQuote(log_dir)).c_str());
+  if (mkdir_status == 0) {
+    after_rgb_path = log_dir + "/" + pending.request_id + "_after_rgb.png";
+    if (!saveLatestRGBImage(after_rgb_path, after_rgb_error))
+      after_rgb_path.clear();
+  }
+
+  string verdict = "uncertain";
+  vector<string> reason_codes;
+  double distance_after = -1.0;
+  string distance_source_after;
+  bool have_distance_after = false;
+  double target_progress = 0.0;
+  bool have_target_progress = false;
+  const bool have_endpoint_to_gt_path = critic_have_endpoint_to_gt_path_;
+  const double endpoint_to_gt_path =
+      have_endpoint_to_gt_path ? critic_endpoint_to_gt_path_ : -1.0;
+
+  if (isVLMForcedLookDecision(pending.selected_action)) {
+    verdict = "scan_unjudged";
+    reason_codes.push_back("scan_action_not_judged_v1");
+  }
+  else if (pending.selected_action == "SELECT_WAYPOINT") {
+    have_distance_after =
+        getCriticDistanceToTarget(cur_pos, distance_after, distance_source_after, reason_codes);
+    if (pending.have_distance_before && have_distance_after) {
+      target_progress = pending.distance_to_target_before - distance_after;
+      have_target_progress = true;
+      if (target_progress >= ep_->reflection_positive_progress_threshold_) {
+        verdict = "good";
+        reason_codes.push_back("positive_target_progress");
+      }
+      else if (target_progress <= ep_->reflection_negative_progress_threshold_) {
+        reason_codes.push_back("negative_target_progress");
+        if (!have_endpoint_to_gt_path) {
+          verdict = "bad";
+          reason_codes.push_back("gt_trajectory_unavailable");
+        }
+        else if (endpoint_to_gt_path >= ep_->reflection_path_deviation_threshold_) {
+          verdict = "bad";
+          reason_codes.push_back("endpoint_deviates_from_gt_path");
+        }
+        else {
+          verdict = "uncertain";
+          reason_codes.push_back("negative_progress_but_near_gt_path");
+        }
+      }
+      else {
+        verdict = "uncertain";
+        reason_codes.push_back("target_progress_within_uncertain_band");
+      }
+    }
+    else {
+      verdict = "uncertain";
+      reason_codes.push_back("missing_target_distance_for_progress");
+    }
+  }
+  else {
+    verdict = "uncertain";
+    reason_codes.push_back("unsupported_action_for_critic_v1");
+  }
+
+  if (after_rgb_path.empty())
+    reason_codes.push_back("after_rgb_unavailable");
+  if (pending.selected_action == "SELECT_WAYPOINT" && !have_endpoint_to_gt_path)
+    reason_codes.push_back("gt_trajectory_unavailable_for_endpoint_metric");
+
+  if (isVLMForcedLookDecision(pending.selected_action)) {
+    ROS_ASSERT_MSG(verdict == "scan_unjudged",
+        "[GTTrainingCritic] scan actions must be marked scan_unjudged");
+  }
+
+  writeCriticDecisionRecord(pending, cur_pos, outcome_reason, verdict, reason_codes,
+      distance_after, have_distance_after, distance_source_after, target_progress,
+      have_target_progress, endpoint_to_gt_path, have_endpoint_to_gt_path, after_rgb_path);
+  updateCriticEpisodeStats(pending.selected_action, verdict, have_target_progress,
+      target_progress, have_endpoint_to_gt_path, endpoint_to_gt_path);
+}
+
+void ExplorationManager::writeCriticDecisionRecord(const GTTrainingCriticPendingDecision& pending,
+    const Vector2d& final_pos, const string& outcome_reason, const string& verdict,
+    const vector<string>& reason_codes, double distance_after, bool have_distance_after,
+    const string& distance_source_after, double target_progress, bool have_target_progress,
+    double endpoint_to_gt_path, bool have_endpoint_to_gt_path, const string& after_rgb_path)
+{
+  const string log_dir = ep_->reflection_critic_log_dir_;
+  const int mkdir_status = std::system(("mkdir -p " + shellQuote(log_dir)).c_str());
+  if (mkdir_status != 0)
+    return;
+
+  const string log_path = log_dir + "/" + pending.request_id + "_critic.json";
+  std::ofstream log_file(log_path);
+  if (!log_file.is_open())
+    return;
+
+  auto writeNullableDouble = [&](double value, bool available) {
+    if (available)
+      log_file << value;
+    else
+      log_file << "null";
+  };
+
+  log_file << std::fixed << std::setprecision(4);
+  log_file << "{\n";
+  log_file << "  \"episode_id\": " << pending.episode_id << ",\n";
+  log_file << "  \"step_id\": " << pending.step_id << ",\n";
+  log_file << "  \"request_id\": \"" << jsonEscape(pending.request_id) << "\",\n";
+  log_file << "  \"selected_action\": \"" << jsonEscape(pending.selected_action) << "\",\n";
+  log_file << "  \"selected_id\": ";
+  if (pending.selected_id.empty())
+    log_file << "null";
+  else
+    log_file << "\"" << jsonEscape(pending.selected_id) << "\"";
+  log_file << ",\n";
+  log_file << "  \"candidate_type\": \"" << jsonEscape(pending.candidate_type) << "\",\n";
+  log_file << "  \"direction_group\": \"" << jsonEscape(pending.direction_group) << "\",\n";
+  log_file << "  \"vlm_reason\": \"" << jsonEscape(pending.vlm_reason) << "\",\n";
+  log_file << "  \"confidence\": " << pending.confidence << ",\n";
+  log_file << "  \"annotated_rgb_path\": \"" << jsonEscape(pending.annotated_rgb_path) << "\",\n";
+  log_file << "  \"critic_annotated_rgb_path\": \"" << jsonEscape(pending.copied_annotated_rgb_path) << "\",\n";
+  log_file << "  \"after_rgb_path\": ";
+  if (after_rgb_path.empty())
+    log_file << "null";
+  else
+    log_file << "\"" << jsonEscape(after_rgb_path) << "\"";
+  log_file << ",\n";
+  log_file << "  \"anchor_position\": [" << pending.anchor_position(0) << ", "
+           << pending.anchor_position(1) << "],\n";
+  log_file << "  \"final_position\": [" << final_pos(0) << ", " << final_pos(1) << "],\n";
+  log_file << "  \"execution_outcome\": \"" << jsonEscape(outcome_reason) << "\",\n";
+  log_file << "  \"distance_to_target_before\": ";
+  writeNullableDouble(pending.distance_to_target_before, pending.have_distance_before);
+  log_file << ",\n";
+  log_file << "  \"distance_to_target_after\": ";
+  writeNullableDouble(distance_after, have_distance_after);
+  log_file << ",\n";
+  log_file << "  \"distance_source_before\": \"" << jsonEscape(pending.distance_source_before)
+           << "\",\n";
+  log_file << "  \"distance_source_after\": \"" << jsonEscape(distance_source_after) << "\",\n";
+  log_file << "  \"target_progress\": ";
+  writeNullableDouble(target_progress, have_target_progress);
+  log_file << ",\n";
+  log_file << "  \"endpoint_to_gt_path\": ";
+  writeNullableDouble(endpoint_to_gt_path, have_endpoint_to_gt_path);
+  log_file << ",\n";
+  log_file << "  \"critic_verdict\": \"" << jsonEscape(verdict) << "\",\n";
+  log_file << "  \"private_reason_codes\": [";
+  for (size_t i = 0; i < reason_codes.size(); ++i) {
+    log_file << "\"" << jsonEscape(reason_codes[i]) << "\"";
+    if (i + 1 < reason_codes.size())
+      log_file << ", ";
+  }
+  log_file << "],\n";
+  log_file << "  \"private_metrics\": {\n";
+  log_file << "    \"prefer_geodesic_distance\": "
+           << (ep_->reflection_prefer_geodesic_distance_ ? "true" : "false") << ",\n";
+  log_file << "    \"positive_progress_threshold\": "
+           << ep_->reflection_positive_progress_threshold_ << ",\n";
+  log_file << "    \"negative_progress_threshold\": "
+           << ep_->reflection_negative_progress_threshold_ << ",\n";
+  log_file << "    \"path_deviation_threshold\": "
+           << ep_->reflection_path_deviation_threshold_ << ",\n";
+  log_file << "    \"critic_gt_episode_id\": " << critic_gt_episode_id_ << ",\n";
+  log_file << "    \"critic_gt_step_id\": " << critic_gt_step_id_ << "\n";
+  log_file << "  },\n";
+  log_file << "  \"scan_history\": " << pending.scan_history_json << "\n";
+  log_file << "}\n";
+}
+
+void ExplorationManager::updateCriticEpisodeStats(const string& action, const string& verdict,
+    bool have_target_progress, double target_progress, bool have_endpoint_to_gt_path,
+    double endpoint_to_gt_path)
+{
+  if (critic_stats_.episode_id != episode_index_)
+    resetCriticEpisodeStats(episode_index_);
+
+  critic_stats_.total_vlm_decisions++;
+  if (isVLMForcedLookDecision(action))
+    critic_stats_.scan_decisions++;
+  else
+    critic_stats_.waypoint_decisions++;
+
+  if (verdict == "good") {
+    critic_stats_.good_count++;
+    if (have_target_progress)
+      critic_stats_.good_target_progress_sum += target_progress;
+  }
+  else if (verdict == "bad") {
+    critic_stats_.bad_count++;
+    if (have_target_progress)
+      critic_stats_.bad_target_progress_sum += target_progress;
+    if (have_endpoint_to_gt_path) {
+      critic_stats_.bad_endpoint_to_gt_path_sum += endpoint_to_gt_path;
+      critic_stats_.bad_endpoint_to_gt_path_count++;
+    }
+  }
+  else if (verdict == "scan_unjudged") {
+    critic_stats_.scan_unjudged_count++;
+  }
+  else {
+    critic_stats_.uncertain_count++;
+  }
+}
+
+void ExplorationManager::writeCriticEpisodeSummary(const string& reason)
+{
+  if (!isCriticOnlyDebugMode() || critic_stats_.episode_id < 0)
+    return;
+
+  if (critic_pending_.active)
+    finalizePendingCriticDecision(critic_last_planning_pos_, "episode_summary_flush_" + reason);
+
+  const string log_dir = ep_->reflection_critic_log_dir_;
+  const int mkdir_status = std::system(("mkdir -p " + shellQuote(log_dir)).c_str());
+  if (mkdir_status != 0)
+    return;
+
+  const string summary_path =
+      log_dir + "/episode_" + std::to_string(critic_stats_.episode_id) + "_summary.json";
+  std::ofstream summary_file(summary_path);
+  if (!summary_file.is_open())
+    return;
+
+  auto avgOrNull = [&](double sum, int count) {
+    if (count > 0)
+      summary_file << (sum / static_cast<double>(count));
+    else
+      summary_file << "null";
+  };
+
+  summary_file << std::fixed << std::setprecision(4);
+  summary_file << "{\n";
+  summary_file << "  \"episode_id\": " << critic_stats_.episode_id << ",\n";
+  summary_file << "  \"summary_reason\": \"" << jsonEscape(reason) << "\",\n";
+  summary_file << "  \"total_vlm_decisions\": " << critic_stats_.total_vlm_decisions << ",\n";
+  summary_file << "  \"waypoint_decisions\": " << critic_stats_.waypoint_decisions << ",\n";
+  summary_file << "  \"scan_decisions\": " << critic_stats_.scan_decisions << ",\n";
+  summary_file << "  \"good_count\": " << critic_stats_.good_count << ",\n";
+  summary_file << "  \"bad_count\": " << critic_stats_.bad_count << ",\n";
+  summary_file << "  \"uncertain_count\": " << critic_stats_.uncertain_count << ",\n";
+  summary_file << "  \"scan_unjudged_count\": " << critic_stats_.scan_unjudged_count << ",\n";
+  summary_file << "  \"average_target_progress_for_good\": ";
+  avgOrNull(critic_stats_.good_target_progress_sum, critic_stats_.good_count);
+  summary_file << ",\n";
+  summary_file << "  \"average_target_progress_for_bad\": ";
+  avgOrNull(critic_stats_.bad_target_progress_sum, critic_stats_.bad_count);
+  summary_file << ",\n";
+  summary_file << "  \"average_endpoint_to_gt_path_for_bad\": ";
+  avgOrNull(critic_stats_.bad_endpoint_to_gt_path_sum,
+      critic_stats_.bad_endpoint_to_gt_path_count);
+  summary_file << "\n";
+  summary_file << "}\n";
+}
+
+bool ExplorationManager::isOracleFrontierRolloutMode() const
+{
+  return ep_ && ep_->oracle_frontier_rollout_enabled_;
+}
+
+bool ExplorationManager::isOracleFrontierLabelOnlyMode() const
+{
+  return ep_ && ep_->oracle_frontier_label_only_enabled_ &&
+         !ep_->oracle_frontier_rollout_enabled_;
+}
+
+bool ExplorationManager::shouldStopOracleRolloutAtTarget(const Vector2d& cur_pos) const
+{
+  if (!isOracleFrontierRolloutMode())
+    return false;
+
+  double distance_to_target = -1.0;
+  string distance_source;
+  vector<string> reason_codes;
+  if (!getCriticDistanceToTarget(cur_pos, distance_to_target, distance_source, reason_codes))
+    return false;
+
+  if (distance_to_target > ep_->oracle_frontier_success_distance_)
+    return false;
+
+  ROS_WARN("[FrontierOracle] GT success radius reached: distance_to_target=%.4f <= %.4f "
+           "(source=%s); stopping oracle rollout.",
+      distance_to_target, ep_->oracle_frontier_success_distance_,
+      distance_source.c_str());
+  return true;
+}
+
+vector<FrontierOracleCandidateScore> ExplorationManager::requestFrontierOracleScores(
+    const string& request_id, const Vector2d& cur_pos,
+    const vector<VLMWaypointCandidate>& candidates)
+{
+  vector<FrontierOracleCandidateScore> scores(candidates.size());
+  for (size_t i = 0; i < candidates.size(); ++i)
+    scores[i].id = candidates[i].id;
+
+  vector<string> candidate_ids;
+  vector<double> candidate_xy;
+  candidate_ids.reserve(candidates.size());
+  candidate_xy.reserve(candidates.size() * 2);
+  for (const auto& candidate : candidates) {
+    candidate_ids.push_back(candidate.id);
+    candidate_xy.push_back(candidate.safe_goal(0));
+    candidate_xy.push_back(candidate.safe_goal(1));
+  }
+
+  vector<double> current_xy = { cur_pos(0), cur_pos(1) };
+  oracle_scan_direction_hint_ = "LOOK_LEFT_60";
+  oracle_scan_direction_source_ = "unavailable";
+  oracle_have_gt_path_hint_ = false;
+  oracle_lookahead_bearing_deg_ = 0.0;
+  oracle_current_gt_path_s_ = std::numeric_limits<double>::quiet_NaN();
+  oracle_gt_path_length_ = std::numeric_limits<double>::quiet_NaN();
+  oracle_lookahead_point_ = Vector2d::Zero();
+  oracle_downstairs_required_ = false;
+  oracle_target_path_downward_drop_ = 0.0;
+  oracle_target_path_endpoint_height_delta_ = 0.0;
+  ros::param::set("/apexnav/frontier_oracle/current_xy", current_xy);
+  ros::param::set("/apexnav/frontier_oracle/candidate_ids", candidate_ids);
+  ros::param::set("/apexnav/frontier_oracle/candidate_xy", candidate_xy);
+  ros::param::set("/apexnav/frontier_oracle/gt_path_lookahead_m",
+      ep_->oracle_frontier_gt_path_lookahead_m_);
+  ros::param::set("/apexnav/frontier_oracle/max_downward_drop_m",
+      ep_->oracle_frontier_max_downward_drop_m_);
+  ros::param::set("/apexnav/frontier_oracle/request_stamp", ros::Time::now().toSec());
+  ros::param::set("/apexnav/frontier_oracle/request_id", request_id);
+
+  string response_id;
+  vector<double> response_scores;
+  int response_stride = 4;
+  const ros::Time start_time = ros::Time::now();
+  bool have_response = false;
+  while ((ros::Time::now() - start_time).toSec() < ep_->oracle_frontier_response_timeout_) {
+    if (ros::param::get("/apexnav/frontier_oracle/response_id", response_id) &&
+        response_id == request_id &&
+        ros::param::get("/apexnav/frontier_oracle/response_scores", response_scores)) {
+      ros::param::param("/apexnav/frontier_oracle/response_stride", response_stride, 4);
+      response_stride = std::max(4, response_stride);
+      if (response_scores.size() < candidates.size() * static_cast<size_t>(response_stride)) {
+        ros::Duration(0.05).sleep();
+        continue;
+      }
+      have_response = true;
+      break;
+    }
+    ros::Duration(0.05).sleep();
+  }
+
+  double current_to_target = -1.0;
+  string current_distance_source;
+  vector<string> distance_warnings;
+  const bool have_current_to_target =
+      getCriticDistanceToTarget(cur_pos, current_to_target, current_distance_source,
+          distance_warnings);
+
+  if (have_response) {
+    string scan_hint;
+    string scan_source;
+    vector<double> lookahead_xy;
+    double lookahead_bearing_deg = 0.0;
+    double current_gt_path_s = std::numeric_limits<double>::quiet_NaN();
+    double gt_path_length = std::numeric_limits<double>::quiet_NaN();
+    double target_path_downward_drop = 0.0;
+    double target_path_endpoint_height_delta = 0.0;
+    bool path_available = false;
+    bool downstairs_required = false;
+    if (ros::param::get("/apexnav/frontier_oracle/response_scan_direction", scan_hint) &&
+        (scan_hint == "LOOK_LEFT_60" || scan_hint == "LOOK_RIGHT_60")) {
+      oracle_scan_direction_hint_ = scan_hint;
+    }
+    if (ros::param::get("/apexnav/frontier_oracle/response_scan_direction_source",
+            scan_source))
+      oracle_scan_direction_source_ = scan_source;
+    if (ros::param::get("/apexnav/frontier_oracle/response_lookahead_bearing_deg",
+            lookahead_bearing_deg) && std::isfinite(lookahead_bearing_deg))
+      oracle_lookahead_bearing_deg_ = lookahead_bearing_deg;
+    if (ros::param::get("/apexnav/frontier_oracle/response_current_gt_path_s",
+            current_gt_path_s) && std::isfinite(current_gt_path_s))
+      oracle_current_gt_path_s_ = current_gt_path_s;
+    if (ros::param::get("/apexnav/frontier_oracle/response_gt_path_length",
+            gt_path_length) && std::isfinite(gt_path_length))
+      oracle_gt_path_length_ = gt_path_length;
+    if (ros::param::get("/apexnav/frontier_oracle/response_target_path_downward_drop",
+            target_path_downward_drop) && std::isfinite(target_path_downward_drop))
+      oracle_target_path_downward_drop_ = target_path_downward_drop;
+    if (ros::param::get(
+            "/apexnav/frontier_oracle/response_target_path_endpoint_height_delta",
+            target_path_endpoint_height_delta) &&
+        std::isfinite(target_path_endpoint_height_delta))
+      oracle_target_path_endpoint_height_delta_ = target_path_endpoint_height_delta;
+    if (ros::param::get("/apexnav/frontier_oracle/response_lookahead_xy", lookahead_xy) &&
+        lookahead_xy.size() >= 2 && std::isfinite(lookahead_xy[0]) &&
+        std::isfinite(lookahead_xy[1]))
+      oracle_lookahead_point_ = Vector2d(lookahead_xy[0], lookahead_xy[1]);
+    ros::param::param("/apexnav/frontier_oracle/response_gt_path_available",
+        path_available, false);
+    ros::param::param("/apexnav/frontier_oracle/response_downstairs_required",
+        downstairs_required, false);
+    oracle_have_gt_path_hint_ = path_available;
+    oracle_downstairs_required_ = downstairs_required;
+
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      const size_t base = i * static_cast<size_t>(response_stride);
+      scores[i].current_to_candidate = response_scores[base + 0];
+      scores[i].candidate_to_target = response_scores[base + 1];
+      scores[i].total_geodesic = response_scores[base + 2];
+      scores[i].geodesic_available = response_scores[base + 3] > 0.5 &&
+          std::isfinite(scores[i].current_to_candidate) &&
+          std::isfinite(scores[i].candidate_to_target) &&
+          std::isfinite(scores[i].total_geodesic) &&
+          scores[i].total_geodesic < 1e8;
+      scores[i].source = scores[i].geodesic_available ? "habitat_geodesic" : "unavailable";
+      if (have_current_to_target && std::isfinite(scores[i].candidate_to_target))
+        scores[i].target_progress = current_to_target - scores[i].candidate_to_target;
+      if (response_stride >= 10) {
+        scores[i].endpoint_to_gt_path = response_scores[base + 4];
+        scores[i].current_gt_path_s = response_scores[base + 5];
+        scores[i].candidate_gt_path_s = response_scores[base + 6];
+        scores[i].gt_path_progress = response_scores[base + 7];
+        scores[i].progress_per_cost = response_scores[base + 8];
+        scores[i].gt_path_available = response_scores[base + 9] > 0.5 &&
+            std::isfinite(scores[i].endpoint_to_gt_path) &&
+            std::isfinite(scores[i].current_gt_path_s) &&
+            std::isfinite(scores[i].candidate_gt_path_s) &&
+            std::isfinite(scores[i].gt_path_progress);
+        if (scores[i].gt_path_available)
+          scores[i].source = "habitat_gt_path";
+      }
+      if (response_stride >= 13) {
+        scores[i].path_downward_drop = response_scores[base + 10];
+        scores[i].endpoint_height_delta = response_scores[base + 11];
+        scores[i].downstairs_path = response_scores[base + 12] > 0.5;
+      }
+      if (response_stride >= 16) {
+        scores[i].remaining_path_downward_drop = response_scores[base + 13];
+        scores[i].remaining_endpoint_height_delta = response_scores[base + 14];
+        scores[i].remaining_downstairs_path = response_scores[base + 15] > 0.5;
+      }
+      if (response_stride >= 20) {
+        scores[i].path_stairwell_drop = response_scores[base + 16];
+        scores[i].stairwell_path = response_scores[base + 17] > 0.5;
+        scores[i].remaining_path_stairwell_drop = response_scores[base + 18];
+        scores[i].remaining_stairwell_path = response_scores[base + 19] > 0.5;
+      }
+    }
+    return scores;
+  }
+
+  ROS_WARN("[FrontierOracle] No Habitat geodesic response for request=%s; fallback to Euclidean/private target position",
+      request_id.c_str());
+
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    scores[i].current_to_candidate = std::isfinite(candidates[i].path_length)
+        ? candidates[i].path_length
+        : (candidates[i].safe_goal - cur_pos).norm();
+    if (critic_have_target_position_) {
+      scores[i].candidate_to_target = (candidates[i].safe_goal - critic_target_position_).norm();
+      scores[i].total_geodesic = scores[i].current_to_candidate + scores[i].candidate_to_target;
+      scores[i].geodesic_available = false;
+      scores[i].source = "euclidean_fallback";
+      if (have_current_to_target)
+        scores[i].target_progress = current_to_target - scores[i].candidate_to_target;
+    }
+  }
+  return scores;
+}
+
+bool ExplorationManager::selectWaypointWithFrontierOracle(const string& request_id,
+    const Vector2d& cur_pos, double cur_yaw, const vector<VLMWaypointCandidate>& candidates,
+    VLMDecisionResult& decision, VLMWaypointCandidate& selected)
+{
+  decision = VLMDecisionResult();
+  decision.decision = "SELECT_WAYPOINT";
+  decision.front_scene_type = "frontier_oracle_rollout";
+  decision.confidence = 1.0;
+
+  auto normalizeAngle = [](double angle) {
+    while (angle > M_PI) angle -= 2.0 * M_PI;
+    while (angle <= -M_PI) angle += 2.0 * M_PI;
+    return angle;
+  };
+
+  auto setOracleScanDecisionFromGTPath = [&](const string& base_reason) {
+    decision.selected_id.clear();
+    decision.decision = "LOOK_LEFT_60";
+
+    bool have_gt_path_bearing = false;
+    double bearing_deg = 0.0;
+    if (oracle_have_gt_path_hint_ && std::isfinite(oracle_lookahead_point_(0)) &&
+        std::isfinite(oracle_lookahead_point_(1))) {
+      const Vector2d to_lookahead = oracle_lookahead_point_ - cur_pos;
+      if (to_lookahead.norm() > 1e-3) {
+        const double bearing =
+            normalizeAngle(std::atan2(to_lookahead(1), to_lookahead(0)) - cur_yaw);
+        bearing_deg = bearing * 180.0 / M_PI;
+        decision.decision = bearing_deg >= 0.0 ? "LOOK_LEFT_60" : "LOOK_RIGHT_60";
+        oracle_scan_direction_hint_ = decision.decision;
+        oracle_scan_direction_source_ = "gt_path_lookahead";
+        oracle_lookahead_bearing_deg_ = bearing_deg;
+        have_gt_path_bearing = true;
+      }
+    }
+
+    bool have_target_bearing = false;
+    double target_bearing_deg = 0.0;
+    if (!have_gt_path_bearing && critic_have_target_position_) {
+      const double target_bearing =
+          normalizeAngle(std::atan2(critic_target_position_(1) - cur_pos(1),
+                             critic_target_position_(0) - cur_pos(0)) -
+              cur_yaw);
+      target_bearing_deg = target_bearing * 180.0 / M_PI;
+      decision.decision = target_bearing_deg >= 0.0 ? "LOOK_LEFT_60" : "LOOK_RIGHT_60";
+      oracle_scan_direction_hint_ = decision.decision;
+      oracle_scan_direction_source_ = "target_bearing_fallback";
+      oracle_lookahead_bearing_deg_ = target_bearing_deg;
+      have_target_bearing = true;
+    }
+
+    std::ostringstream reason;
+    reason << std::fixed << std::setprecision(3) << base_reason << "; ";
+    if (have_gt_path_bearing) {
+      reason << "private GT shortest-path lookahead bearing=" << bearing_deg
+             << " deg relative to current yaw, lookahead_xy=["
+             << oracle_lookahead_point_(0) << ", " << oracle_lookahead_point_(1)
+             << "], current_gt_path_s=" << oracle_current_gt_path_s_
+             << ", gt_path_length=" << oracle_gt_path_length_
+             << ", choosing " << decision.decision
+             << " to reveal VLM-selectable candidates along the GT path.";
+    }
+    else if (have_target_bearing) {
+      reason << "private GT path lookahead unavailable; fallback target bearing="
+             << target_bearing_deg << " deg relative to current yaw, choosing "
+             << decision.decision << ".";
+    }
+    else {
+      oracle_scan_direction_hint_ = decision.decision;
+      oracle_scan_direction_source_ = "default_left";
+      reason << "private GT path and target direction unavailable, defaulting to LOOK_LEFT_60.";
+    }
+    decision.reason = reason.str();
+  };
+
+  vector<VLMWaypointCandidate> visible_candidates;
+  for (const auto& candidate : candidates) {
+    if (candidate.reachable && candidate.has_projection)
+      visible_candidates.push_back(candidate);
+  }
+
+  if (visible_candidates.empty()) {
+    const vector<FrontierOracleCandidateScore> empty_scores =
+        requestFrontierOracleScores(request_id, cur_pos, visible_candidates);
+    setOracleScanDecisionFromGTPath(
+        "Frontier oracle found no visible reachable waypoint candidates");
+    writeFrontierOracleLogAndImage(request_id, cur_pos, cur_yaw, candidates, {}, "", decision.reason);
+    return true;
+  }
+
+  vector<FrontierOracleCandidateScore> scores =
+      requestFrontierOracleScores(request_id, cur_pos, visible_candidates);
+
+  auto isDownstairsRejected = [&](const FrontierOracleCandidateScore& score) {
+    return ep_->oracle_frontier_reject_downstairs_ &&
+        (score.downstairs_path || score.stairwell_path);
+  };
+  auto blockDownstairs = [&](const string& base_reason) {
+    oracle_frontier_blocked_downstairs_ = true;
+    decision.selected_id.clear();
+    decision.decision = "BLOCKED_DOWNSTAIRS";
+    std::ostringstream reason;
+    reason << std::fixed << std::setprecision(3) << base_reason
+           << "; no-downstairs constraint active, max_allowed_downward_drop="
+           << ep_->oracle_frontier_max_downward_drop_m_
+           << ", target_path_downward_drop=" << oracle_target_path_downward_drop_
+           << ", target_path_endpoint_height_delta="
+           << oracle_target_path_endpoint_height_delta_
+           << ". Stop this decision because every visible executable waypoint would enter downstairs/stairwell geometry.";
+    decision.reason = reason.str();
+    writeFrontierOracleLogAndImage(
+        request_id, cur_pos, cur_yaw, visible_candidates, scores, "", decision.reason);
+    return true;
+  };
+
+  int downstairs_candidate_count = 0;
+  for (const auto& score : scores) {
+    if (isDownstairsRejected(score))
+      ++downstairs_candidate_count;
+  }
+  if (!scores.empty() && downstairs_candidate_count == static_cast<int>(scores.size()) &&
+      vlm_scan_count_ < ep_->vlm_max_scan_steps_) {
+    setOracleScanDecisionFromGTPath(
+        "Frontier oracle rejected every visible candidate because each current->candidate executable path enters downstairs/stairwell geometry; scan for a same-floor waypoint instead");
+    writeFrontierOracleLogAndImage(request_id, cur_pos, cur_yaw, visible_candidates, scores,
+        "", decision.reason);
+    return true;
+  }
+  if (!scores.empty() && downstairs_candidate_count == static_cast<int>(scores.size()) &&
+      vlm_scan_count_ >= ep_->vlm_max_scan_steps_) {
+    return blockDownstairs(
+        "Frontier oracle rejected every visible candidate because each current->candidate executable path enters downstairs/stairwell geometry");
+  }
+
+  int gt_path_metric_count = 0;
+  int qualified_gt_path_count = 0;
+  for (const auto& score : scores) {
+    if (isDownstairsRejected(score))
+      continue;
+    if (!score.gt_path_available)
+      continue;
+    ++gt_path_metric_count;
+    if (score.endpoint_to_gt_path <= ep_->oracle_frontier_gt_path_deviation_threshold_ &&
+        score.gt_path_progress >= ep_->oracle_frontier_min_gt_path_progress_to_select_)
+      ++qualified_gt_path_count;
+  }
+
+  if (gt_path_metric_count > 0 && qualified_gt_path_count == 0 &&
+      vlm_scan_count_ < ep_->vlm_max_scan_steps_) {
+    std::ostringstream reason;
+    reason << std::fixed << std::setprecision(3)
+           << "Frontier oracle found visible candidates, but none satisfy GT path criteria "
+           << "(endpoint_to_gt_path <= "
+           << ep_->oracle_frontier_gt_path_deviation_threshold_
+           << ", gt_path_progress >= "
+           << ep_->oracle_frontier_min_gt_path_progress_to_select_
+           << "); scan instead of committing to an off-path waypoint";
+    setOracleScanDecisionFromGTPath(reason.str());
+    writeFrontierOracleLogAndImage(request_id, cur_pos, cur_yaw, visible_candidates, scores,
+        "", decision.reason);
+    return true;
+  }
+
+  int best_idx = -1;
+  auto finiteDistance = [](double value) {
+    return std::isfinite(value) && value < 1e8;
+  };
+
+  auto betterGtPathCandidate = [&](int lhs, int rhs) {
+    if (rhs < 0)
+      return true;
+    const auto& a = scores[lhs];
+    const auto& b = scores[rhs];
+
+    const bool a_success =
+        finiteDistance(a.candidate_to_target) &&
+        a.candidate_to_target <= ep_->oracle_frontier_success_distance_;
+    const bool b_success =
+        finiteDistance(b.candidate_to_target) &&
+        b.candidate_to_target <= ep_->oracle_frontier_success_distance_;
+    if (a_success != b_success)
+      return a_success;
+
+    if (a.remaining_downstairs_path != b.remaining_downstairs_path)
+      return !a.remaining_downstairs_path;
+    if (std::fabs(a.gt_path_progress - b.gt_path_progress) > 0.25)
+      return a.gt_path_progress > b.gt_path_progress;
+    if (std::fabs(a.progress_per_cost - b.progress_per_cost) > 0.05)
+      return a.progress_per_cost > b.progress_per_cost;
+    if (std::fabs(a.remaining_path_downward_drop - b.remaining_path_downward_drop) > 1e-3)
+      return a.remaining_path_downward_drop < b.remaining_path_downward_drop;
+    if (std::fabs(a.endpoint_to_gt_path - b.endpoint_to_gt_path) > 1e-3)
+      return a.endpoint_to_gt_path < b.endpoint_to_gt_path;
+    if (std::fabs(a.candidate_to_target - b.candidate_to_target) > 1e-3)
+      return a.candidate_to_target < b.candidate_to_target;
+    if (std::fabs(visible_candidates[lhs].path_length - visible_candidates[rhs].path_length) >
+        1e-3)
+      return visible_candidates[lhs].path_length < visible_candidates[rhs].path_length;
+    return visible_candidates[lhs].id < visible_candidates[rhs].id;
+  };
+
+  auto betterFallbackCandidate = [&](int lhs, int rhs) {
+    if (rhs < 0)
+      return true;
+    const auto& a = scores[lhs];
+    const auto& b = scores[rhs];
+
+    const bool a_success =
+        finiteDistance(a.candidate_to_target) &&
+        a.candidate_to_target <= ep_->oracle_frontier_success_distance_;
+    const bool b_success =
+        finiteDistance(b.candidate_to_target) &&
+        b.candidate_to_target <= ep_->oracle_frontier_success_distance_;
+    if (a_success != b_success)
+      return a_success;
+
+    if (a.remaining_stairwell_path != b.remaining_stairwell_path)
+      return !a.remaining_stairwell_path;
+    if (a.remaining_downstairs_path != b.remaining_downstairs_path)
+      return !a.remaining_downstairs_path;
+    if (std::fabs(a.remaining_path_stairwell_drop - b.remaining_path_stairwell_drop) > 1e-3)
+      return a.remaining_path_stairwell_drop < b.remaining_path_stairwell_drop;
+    if (std::fabs(a.remaining_path_downward_drop - b.remaining_path_downward_drop) > 1e-3)
+      return a.remaining_path_downward_drop < b.remaining_path_downward_drop;
+    if (std::fabs(a.total_geodesic - b.total_geodesic) > 1e-3)
+      return a.total_geodesic < b.total_geodesic;
+    if (std::fabs(a.candidate_to_target - b.candidate_to_target) > 1e-3)
+      return a.candidate_to_target < b.candidate_to_target;
+    return visible_candidates[lhs].path_length < visible_candidates[rhs].path_length;
+  };
+
+  if (gt_path_metric_count > 0) {
+    for (int i = 0; i < static_cast<int>(visible_candidates.size()); ++i) {
+      const auto& score = scores[i];
+      if (isDownstairsRejected(score))
+        continue;
+      if (!score.gt_path_available)
+        continue;
+      const bool qualified =
+          score.endpoint_to_gt_path <= ep_->oracle_frontier_gt_path_deviation_threshold_ &&
+          score.gt_path_progress >= ep_->oracle_frontier_min_gt_path_progress_to_select_;
+      if (qualified_gt_path_count > 0 && !qualified)
+        continue;
+      if (betterGtPathCandidate(i, best_idx))
+        best_idx = i;
+    }
+  }
+
+  if (best_idx < 0) {
+    int finite_score_count = 0;
+    int nonnegative_progress_count = 0;
+    for (const auto& score : scores) {
+      if (isDownstairsRejected(score))
+        continue;
+      if (!finiteDistance(score.total_geodesic))
+        continue;
+      ++finite_score_count;
+      if (score.target_progress >= ep_->oracle_frontier_min_progress_to_select_)
+        ++nonnegative_progress_count;
+    }
+
+    if (finite_score_count > 0 && nonnegative_progress_count == 0 &&
+        vlm_scan_count_ < ep_->vlm_max_scan_steps_) {
+      std::ostringstream reason;
+      reason << std::fixed << std::setprecision(3)
+             << "Frontier oracle GT path metrics unavailable and every finite-scored "
+             << "candidate reduces target progress below min_progress_to_select="
+             << ep_->oracle_frontier_min_progress_to_select_
+             << "; scan before using fallback geodesic target-distance ranking";
+      setOracleScanDecisionFromGTPath(reason.str());
+      writeFrontierOracleLogAndImage(request_id, cur_pos, cur_yaw, visible_candidates, scores,
+          "", decision.reason);
+      return true;
+    }
+
+    for (int i = 0; i < static_cast<int>(visible_candidates.size()); ++i) {
+      if (isDownstairsRejected(scores[i]))
+        continue;
+      if (!finiteDistance(scores[i].total_geodesic))
+        continue;
+      if (nonnegative_progress_count > 0 &&
+          scores[i].target_progress < ep_->oracle_frontier_min_progress_to_select_)
+        continue;
+      if (betterFallbackCandidate(i, best_idx))
+        best_idx = i;
+    }
+  }
+
+  if (best_idx < 0) {
+    for (int i = 0; i < static_cast<int>(visible_candidates.size()); ++i) {
+      if (i < static_cast<int>(scores.size()) && isDownstairsRejected(scores[i]))
+        continue;
+      if (best_idx < 0 || visible_candidates[i].path_length < visible_candidates[best_idx].path_length)
+        best_idx = i;
+    }
+    if (best_idx < 0)
+      return blockDownstairs("Frontier oracle has no non-downstairs fallback candidate");
+    decision.reason =
+        "Frontier oracle scores unavailable; selected shortest executable visible path.";
+  }
+  else if (scores[best_idx].gt_path_available) {
+    std::ostringstream reason;
+    reason << std::fixed << std::setprecision(3)
+           << "Frontier oracle selected " << visible_candidates[best_idx].id
+           << " as a VLM-selectable waypoint on the private GT shortest path; "
+           << "endpoint_to_gt_path=" << scores[best_idx].endpoint_to_gt_path
+           << ", gt_path_progress=" << scores[best_idx].gt_path_progress
+           << ", progress_per_cost=" << scores[best_idx].progress_per_cost
+           << ", current_to_candidate=" << scores[best_idx].current_to_candidate
+           << ", remaining_to_target=" << scores[best_idx].candidate_to_target
+           << ", path_downward_drop=" << scores[best_idx].path_downward_drop
+           << ", endpoint_height_delta=" << scores[best_idx].endpoint_height_delta
+           << ", path_stairwell_drop=" << scores[best_idx].path_stairwell_drop
+           << ", remaining_path_downward_drop="
+           << scores[best_idx].remaining_path_downward_drop
+           << ", remaining_endpoint_height_delta="
+           << scores[best_idx].remaining_endpoint_height_delta
+           << ", remaining_path_stairwell_drop="
+           << scores[best_idx].remaining_path_stairwell_drop
+           << ", source=" << scores[best_idx].source
+           << ". Selection requires visible/reachable candidates and prioritizes forward "
+           << "progress along the current GT path.";
+    decision.reason = reason.str();
+  }
+  else {
+    std::ostringstream reason;
+    reason << std::fixed << std::setprecision(3)
+           << "Frontier oracle selected " << visible_candidates[best_idx].id
+           << " with fallback current->candidate->target geodesic ranking; total="
+           << scores[best_idx].total_geodesic
+           << ", remaining_to_target=" << scores[best_idx].candidate_to_target
+           << ", progress=" << scores[best_idx].target_progress
+           << ", source=" << scores[best_idx].source
+           << ". GT path projection metrics were unavailable for this decision.";
+    decision.reason = reason.str();
+  }
+
+  selected = visible_candidates[best_idx];
+  decision.selected_id = selected.id;
+  writeFrontierOracleLogAndImage(request_id, cur_pos, cur_yaw, visible_candidates, scores,
+      selected.id, decision.reason);
+  return true;
+}
+
+void ExplorationManager::writeFrontierOracleLogAndImage(const string& request_id,
+    const Vector2d& cur_pos, double cur_yaw, const vector<VLMWaypointCandidate>& candidates,
+    const vector<FrontierOracleCandidateScore>& scores, const string& selected_id,
+    const string& reason)
+{
+  const string log_dir = ep_->oracle_frontier_log_dir_;
+  const int mkdir_status = std::system(("mkdir -p " + shellQuote(log_dir)).c_str());
+  if (mkdir_status != 0)
+    return;
+
+  string annotated_path;
+  if (have_latest_rgb_ && !latest_rgb_image_.empty()) {
+    cv::Mat image = latest_rgb_image_.clone();
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      const auto& candidate = candidates[i];
+      if (!candidate.has_projection)
+        continue;
+      const bool chosen = candidate.id == selected_id;
+      const cv::Scalar fill = chosen ? cv::Scalar(30, 230, 30) :
+          (candidate.source == "local_view" ? cv::Scalar(35, 215, 235)
+                                            : cv::Scalar(35, 80, 255));
+      const cv::Scalar outline = chosen ? cv::Scalar(0, 0, 0) : cv::Scalar(255, 255, 255);
+      const int radius = chosen ? 25 : 18;
+      cv::circle(image, cv::Point(candidate.image_u, candidate.image_v), radius, fill, -1,
+          cv::LINE_AA);
+      cv::circle(image, cv::Point(candidate.image_u, candidate.image_v), radius + 2, outline, 3,
+          cv::LINE_AA);
+      if (chosen) {
+        cv::circle(image, cv::Point(candidate.image_u, candidate.image_v), radius + 7,
+            cv::Scalar(0, 255, 255), 3, cv::LINE_AA);
+      }
+      const string label = candidate.id + (chosen ? "*" : "");
+      int baseline = 0;
+      const cv::Size label_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.62, 2,
+          &baseline);
+      const int tx = candidate.image_u - label_size.width / 2;
+      const int ty = candidate.image_v + label_size.height / 2;
+      cv::putText(image, label, cv::Point(tx, ty), cv::FONT_HERSHEY_SIMPLEX, 0.62,
+          cv::Scalar(20, 20, 20), 2, cv::LINE_AA);
+    }
+    annotated_path = log_dir + "/" + request_id + "_oracle_candidates.png";
+    cv::imwrite(annotated_path, image);
+  }
+
+  const string trajectory_path =
+      log_dir + "/episode_" + std::to_string(episode_index_) + "_oracle_trajectory.jsonl";
+  std::ofstream traj_file(trajectory_path, std::ios::app);
+  if (traj_file.is_open()) {
+    auto writeFinite = [&](double value) {
+      if (std::isfinite(value))
+        traj_file << value;
+      else
+        traj_file << "null";
+    };
+    traj_file << std::fixed << std::setprecision(4);
+    traj_file << "{\"episode_id\": " << episode_index_
+              << ", \"step_id\": " << vlm_request_counter_
+              << ", \"request_id\": \"" << jsonEscape(request_id)
+              << "\", \"created_at\": " << ros::Time::now().toSec()
+              << ", \"selected_action\": \""
+              << jsonEscape(selected_id.empty() && oracle_frontier_blocked_downstairs_
+                         ? "BLOCKED_DOWNSTAIRS"
+                         : (selected_id.empty() ? oracle_scan_direction_hint_ : "SELECT_WAYPOINT"))
+              << "\", \"selected_id\": ";
+    if (selected_id.empty())
+      traj_file << "null";
+    else
+      traj_file << "\"" << jsonEscape(selected_id) << "\"";
+    traj_file << ", \"robot\": [" << cur_pos(0) << ", " << cur_pos(1)
+              << "], \"yaw\": " << cur_yaw
+              << ", \"scan_direction_hint\": \"" << jsonEscape(oracle_scan_direction_hint_)
+              << "\", \"scan_direction_source\": \""
+              << jsonEscape(oracle_scan_direction_source_)
+              << "\", \"gt_path_lookahead_bearing_deg\": ";
+    writeFinite(oracle_lookahead_bearing_deg_);
+    traj_file << ", \"gt_path_lookahead_xy\": [";
+    if (oracle_have_gt_path_hint_) {
+      writeFinite(oracle_lookahead_point_(0));
+      traj_file << ", ";
+      writeFinite(oracle_lookahead_point_(1));
+    }
+    else {
+      traj_file << "null, null";
+    }
+    traj_file << "], \"current_gt_path_s\": ";
+    writeFinite(oracle_current_gt_path_s_);
+    traj_file << ", \"gt_path_length\": ";
+    writeFinite(oracle_gt_path_length_);
+    traj_file << ", \"target_path_downward_drop\": ";
+    writeFinite(oracle_target_path_downward_drop_);
+    traj_file << ", \"target_path_endpoint_height_delta\": ";
+    writeFinite(oracle_target_path_endpoint_height_delta_);
+    traj_file << ", \"target_shortest_path_downstairs\": "
+              << (oracle_downstairs_required_ ? "true" : "false");
+    traj_file << ", \"gt_path_available\": "
+              << (oracle_have_gt_path_hint_ ? "true" : "false")
+              << ", \"reason\": \"" << jsonEscape(reason)
+              << "\", \"annotated_image\": \"" << jsonEscape(annotated_path)
+              << "\", \"candidates\": [";
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      const auto& candidate = candidates[i];
+      const FrontierOracleCandidateScore empty_score;
+      const auto& score = i < scores.size() ? scores[i] : empty_score;
+      traj_file << "{\"id\": \"" << jsonEscape(candidate.id)
+                << "\", \"candidate_type\": \"" << jsonEscape(candidate.source)
+                << "\", \"direction_group\": \"" << jsonEscape(candidate.direction)
+                << "\", \"safe_goal\": [" << candidate.safe_goal(0) << ", "
+                << candidate.safe_goal(1) << "], \"path_length\": "
+                << candidate.path_length << ", \"current_to_candidate\": ";
+      writeFinite(score.current_to_candidate);
+      traj_file << ", \"candidate_to_target\": ";
+      writeFinite(score.candidate_to_target);
+      traj_file << ", \"total_geodesic\": ";
+      writeFinite(score.total_geodesic);
+      traj_file << ", \"target_progress\": ";
+      writeFinite(score.target_progress);
+      traj_file << ", \"endpoint_to_gt_path\": ";
+      writeFinite(score.endpoint_to_gt_path);
+      traj_file << ", \"current_gt_path_s\": ";
+      writeFinite(score.current_gt_path_s);
+      traj_file << ", \"candidate_gt_path_s\": ";
+      writeFinite(score.candidate_gt_path_s);
+      traj_file << ", \"gt_path_progress\": ";
+      writeFinite(score.gt_path_progress);
+      traj_file << ", \"progress_per_cost\": ";
+      writeFinite(score.progress_per_cost);
+      traj_file << ", \"path_downward_drop\": ";
+      writeFinite(score.path_downward_drop);
+      traj_file << ", \"endpoint_height_delta\": ";
+      writeFinite(score.endpoint_height_delta);
+      traj_file << ", \"downstairs_path\": "
+                << (score.downstairs_path ? "true" : "false");
+      traj_file << ", \"path_stairwell_drop\": ";
+      writeFinite(score.path_stairwell_drop);
+      traj_file << ", \"stairwell_path\": "
+                << (score.stairwell_path ? "true" : "false");
+      traj_file << ", \"remaining_path_downward_drop\": ";
+      writeFinite(score.remaining_path_downward_drop);
+      traj_file << ", \"remaining_endpoint_height_delta\": ";
+      writeFinite(score.remaining_endpoint_height_delta);
+      traj_file << ", \"remaining_downstairs_path\": "
+                << (score.remaining_downstairs_path ? "true" : "false");
+      traj_file << ", \"remaining_path_stairwell_drop\": ";
+      writeFinite(score.remaining_path_stairwell_drop);
+      traj_file << ", \"remaining_stairwell_path\": "
+                << (score.remaining_stairwell_path ? "true" : "false");
+      traj_file << ", \"gt_path_available\": "
+                << (score.gt_path_available ? "true" : "false");
+      traj_file << ", \"score_source\": \"" << jsonEscape(score.source)
+                << "\", \"selected\": "
+                << (candidate.id == selected_id ? "true" : "false") << "}";
+      if (i + 1 < candidates.size())
+        traj_file << ", ";
+    }
+    traj_file << "]}\n";
+  }
+}
+
+void ExplorationManager::writeFrontierOraclePanoramaLogAndImages(const string& request_id,
+    const Vector2d& cur_pos, double cur_yaw, const vector<VLMWaypointCandidate>& candidates,
+    const vector<FrontierOracleCandidateScore>& scores, const string& selected_id,
+    const string& reason)
+{
+  const string log_dir = ep_->oracle_frontier_log_dir_;
+  const int mkdir_status = std::system(("mkdir -p " + shellQuote(log_dir)).c_str());
+  if (mkdir_status != 0)
+    return;
+
+  auto candidateViewId = [](const VLMWaypointCandidate& candidate) {
+    const size_t sep = candidate.id.find('_');
+    return sep == string::npos ? string() : candidate.id.substr(0, sep);
+  };
+
+  vector<string> annotated_paths(vlm_initial_panorama_views_.size());
+  for (size_t view_i = 0; view_i < vlm_initial_panorama_views_.size(); ++view_i) {
+    const auto& view = vlm_initial_panorama_views_[view_i];
+    cv::Mat image = cv::imread(view.raw_image_path, cv::IMREAD_COLOR);
+    if (image.empty())
+      continue;
+
+    for (const auto& candidate : view.candidates) {
+      if (!candidate.has_projection)
+        continue;
+      const bool chosen = candidate.id == selected_id;
+      const cv::Scalar fill = chosen ? cv::Scalar(30, 230, 30) :
+          (candidate.source == "local_view" ? cv::Scalar(35, 215, 235)
+                                            : cv::Scalar(35, 80, 255));
+      const cv::Scalar outline = chosen ? cv::Scalar(0, 0, 0) : cv::Scalar(255, 255, 255);
+      const int radius = chosen ? 25 : 18;
+      cv::circle(image, cv::Point(candidate.image_u, candidate.image_v), radius, fill, -1,
+          cv::LINE_AA);
+      cv::circle(image, cv::Point(candidate.image_u, candidate.image_v), radius + 2, outline, 3,
+          cv::LINE_AA);
+      if (chosen) {
+        cv::circle(image, cv::Point(candidate.image_u, candidate.image_v), radius + 7,
+            cv::Scalar(0, 255, 255), 3, cv::LINE_AA);
+      }
+      const string label = candidate.id + (chosen ? "*" : "");
+      int baseline = 0;
+      const cv::Size label_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.58, 2,
+          &baseline);
+      const int tx = std::max(4, candidate.image_u - label_size.width / 2);
+      const int ty = std::max(label_size.height + 4, candidate.image_v + label_size.height / 2);
+      cv::putText(image, label, cv::Point(tx, ty), cv::FONT_HERSHEY_SIMPLEX, 0.58,
+          cv::Scalar(20, 20, 20), 2, cv::LINE_AA);
+    }
+
+    const string annotated_path =
+        log_dir + "/" + request_id + "_" + view.view_id + "_oracle_candidates.png";
+    if (cv::imwrite(annotated_path, image))
+      annotated_paths[view_i] = annotated_path;
+  }
+
+  string primary_annotated_path;
+  if (!selected_id.empty()) {
+    const string selected_view_id =
+        selected_id.find('_') == string::npos ? string() : selected_id.substr(0, selected_id.find('_'));
+    for (size_t i = 0; i < vlm_initial_panorama_views_.size(); ++i) {
+      if (vlm_initial_panorama_views_[i].view_id == selected_view_id &&
+          !annotated_paths[i].empty()) {
+        primary_annotated_path = annotated_paths[i];
+        break;
+      }
+    }
+  }
+  if (primary_annotated_path.empty()) {
+    for (const auto& path : annotated_paths) {
+      if (!path.empty()) {
+        primary_annotated_path = path;
+        break;
+      }
+    }
+  }
+
+  const string trajectory_path =
+      log_dir + "/episode_" + std::to_string(episode_index_) + "_oracle_trajectory.jsonl";
+  std::ofstream traj_file(trajectory_path, std::ios::app);
+  if (!traj_file.is_open())
+    return;
+
+  auto writeFinite = [&](double value) {
+    if (std::isfinite(value))
+      traj_file << value;
+    else
+      traj_file << "null";
+  };
+
+  traj_file << std::fixed << std::setprecision(4);
+  traj_file << "{\"episode_id\": " << episode_index_
+            << ", \"step_id\": " << vlm_request_counter_
+            << ", \"request_id\": \"" << jsonEscape(request_id)
+            << "\", \"created_at\": " << ros::Time::now().toSec()
+            << ", \"source_mode\": \"initial_panorama_oracle\""
+            << ", \"selected_action\": \""
+            << jsonEscape(selected_id.empty() && oracle_frontier_blocked_downstairs_
+                       ? "BLOCKED_DOWNSTAIRS"
+                       : (selected_id.empty() ? oracle_scan_direction_hint_ : "SELECT_WAYPOINT"))
+            << "\", \"selected_id\": ";
+  if (selected_id.empty())
+    traj_file << "null";
+  else
+    traj_file << "\"" << jsonEscape(selected_id) << "\"";
+  traj_file << ", \"robot\": [" << cur_pos(0) << ", " << cur_pos(1)
+            << "], \"yaw\": " << cur_yaw
+            << ", \"scan_direction_hint\": \"" << jsonEscape(oracle_scan_direction_hint_)
+            << "\", \"scan_direction_source\": \""
+            << jsonEscape(oracle_scan_direction_source_)
+            << "\", \"gt_path_lookahead_bearing_deg\": ";
+  writeFinite(oracle_lookahead_bearing_deg_);
+  traj_file << ", \"gt_path_lookahead_xy\": [";
+  if (oracle_have_gt_path_hint_) {
+    writeFinite(oracle_lookahead_point_(0));
+    traj_file << ", ";
+    writeFinite(oracle_lookahead_point_(1));
+  }
+  else {
+    traj_file << "null, null";
+  }
+  traj_file << "], \"current_gt_path_s\": ";
+  writeFinite(oracle_current_gt_path_s_);
+  traj_file << ", \"gt_path_length\": ";
+  writeFinite(oracle_gt_path_length_);
+  traj_file << ", \"target_path_downward_drop\": ";
+  writeFinite(oracle_target_path_downward_drop_);
+  traj_file << ", \"target_path_endpoint_height_delta\": ";
+  writeFinite(oracle_target_path_endpoint_height_delta_);
+  traj_file << ", \"target_shortest_path_downstairs\": "
+            << (oracle_downstairs_required_ ? "true" : "false");
+  traj_file << ", \"gt_path_available\": "
+            << (oracle_have_gt_path_hint_ ? "true" : "false")
+            << ", \"reason\": \"" << jsonEscape(reason)
+            << "\", \"annotated_image\": \"" << jsonEscape(primary_annotated_path)
+            << "\", \"panorama_annotated_images\": [";
+  for (size_t i = 0; i < vlm_initial_panorama_views_.size(); ++i) {
+    const auto& view = vlm_initial_panorama_views_[i];
+    bool selected_in_view = false;
+    for (const auto& candidate : view.candidates) {
+      if (candidate.id == selected_id) {
+        selected_in_view = true;
+        break;
+      }
+    }
+    traj_file << "{\"view_id\": \"" << jsonEscape(view.view_id)
+              << "\", \"view_index\": " << view.view_index
+              << ", \"relative_yaw_deg\": " << view.relative_yaw_deg
+              << ", \"raw_image\": \"" << jsonEscape(view.raw_image_path)
+              << "\", \"annotated_image\": \"" << jsonEscape(annotated_paths[i])
+              << "\", \"candidate_count\": " << view.candidates.size()
+              << ", \"selected_in_view\": " << (selected_in_view ? "true" : "false")
+              << "}";
+    if (i + 1 < vlm_initial_panorama_views_.size())
+      traj_file << ", ";
+  }
+  traj_file << "], \"candidates\": [";
+
+  for (size_t i = 0; i < candidates.size(); ++i) {
+    const auto& candidate = candidates[i];
+    const FrontierOracleCandidateScore empty_score;
+    const auto& score = i < scores.size() ? scores[i] : empty_score;
+    string view_id = candidateViewId(candidate);
+    int view_index = -1;
+    double view_angle = 0.0;
+    for (const auto& view : vlm_initial_panorama_views_) {
+      if (view.view_id == view_id) {
+        view_index = view.view_index;
+        view_angle = view.relative_yaw_deg;
+        break;
+      }
+    }
+    traj_file << "{\"id\": \"" << jsonEscape(candidate.id)
+              << "\", \"view_id\": \"" << jsonEscape(view_id)
+              << "\", \"view_index\": " << view_index
+              << ", \"view_angle_deg\": " << view_angle
+              << ", \"candidate_type\": \"" << jsonEscape(candidate.source)
+              << "\", \"direction_group\": \"" << jsonEscape(candidate.direction)
+              << "\", \"safe_goal\": [" << candidate.safe_goal(0) << ", "
+              << candidate.safe_goal(1) << "], \"path_length\": "
+              << candidate.path_length << ", \"current_to_candidate\": ";
+    writeFinite(score.current_to_candidate);
+    traj_file << ", \"candidate_to_target\": ";
+    writeFinite(score.candidate_to_target);
+    traj_file << ", \"total_geodesic\": ";
+    writeFinite(score.total_geodesic);
+    traj_file << ", \"target_progress\": ";
+    writeFinite(score.target_progress);
+    traj_file << ", \"endpoint_to_gt_path\": ";
+    writeFinite(score.endpoint_to_gt_path);
+    traj_file << ", \"current_gt_path_s\": ";
+    writeFinite(score.current_gt_path_s);
+    traj_file << ", \"candidate_gt_path_s\": ";
+    writeFinite(score.candidate_gt_path_s);
+    traj_file << ", \"gt_path_progress\": ";
+    writeFinite(score.gt_path_progress);
+    traj_file << ", \"progress_per_cost\": ";
+    writeFinite(score.progress_per_cost);
+    traj_file << ", \"path_downward_drop\": ";
+    writeFinite(score.path_downward_drop);
+    traj_file << ", \"endpoint_height_delta\": ";
+    writeFinite(score.endpoint_height_delta);
+    traj_file << ", \"downstairs_path\": "
+              << (score.downstairs_path ? "true" : "false");
+    traj_file << ", \"path_stairwell_drop\": ";
+    writeFinite(score.path_stairwell_drop);
+    traj_file << ", \"stairwell_path\": "
+              << (score.stairwell_path ? "true" : "false");
+    traj_file << ", \"remaining_path_downward_drop\": ";
+    writeFinite(score.remaining_path_downward_drop);
+    traj_file << ", \"remaining_endpoint_height_delta\": ";
+    writeFinite(score.remaining_endpoint_height_delta);
+    traj_file << ", \"remaining_downstairs_path\": "
+              << (score.remaining_downstairs_path ? "true" : "false");
+    traj_file << ", \"remaining_path_stairwell_drop\": ";
+    writeFinite(score.remaining_path_stairwell_drop);
+    traj_file << ", \"remaining_stairwell_path\": "
+              << (score.remaining_stairwell_path ? "true" : "false");
+    traj_file << ", \"gt_path_available\": "
+              << (score.gt_path_available ? "true" : "false")
+              << ", \"score_source\": \"" << jsonEscape(score.source)
+              << "\", \"selected\": "
+              << (candidate.id == selected_id ? "true" : "false") << "}";
+    if (i + 1 < candidates.size())
+      traj_file << ", ";
+  }
+  traj_file << "]}\n";
+}
+
+void ExplorationManager::findVLMGuidedFrontierPolicy(Vector2d cur_pos, double cur_yaw,
+    vector<Vector2d> frontiers, Vector2d& next_best_pos, vector<Vector2d>& next_best_path)
+{
+  next_best_path.clear();
+
+  if (continueActiveVLMWaypoint(cur_pos)) {
+    next_best_pos = ed_->next_pos_;
+    next_best_path = ed_->next_best_path_;
+    return;
+  }
+
+  if (consumeReachedVLMTargetObjectProxyStop()) {
+    vlm_reached_target_object_proxy_stop_in_last_plan_ = true;
+    ROS_WARN("[VLM Target] Reached target proxy confirmed with persistent detector-map evidence; "
+             "skip duplicate candidate generation and LLM selection.");
+    return;
+  }
+
+  if (ep_->vlm_initial_panorama_selection_enabled_ &&
+      !vlm_initial_panorama_consumed_ &&
+      isOracleFrontierRolloutMode() &&
+      static_cast<int>(vlm_initial_panorama_views_.size()) >=
+          ep_->vlm_initial_panorama_min_views_) {
+    const string panorama_request_id = makeVLMRequestId();
+    vector<VLMWaypointCandidate> panorama_candidates;
+    VLMDecisionResult panorama_decision;
+    VLMWaypointCandidate panorama_selected;
+    bool panorama_scan_context_reset = false;
+
+    vlm_initial_panorama_consumed_ = true;
+    const bool panorama_query_ok = selectWaypointWithInitialPanoramaOracle(
+        panorama_request_id, cur_pos, cur_yaw, panorama_candidates, panorama_decision,
+        panorama_selected);
+    const int panorama_visible_candidate_count = std::count_if(
+        panorama_candidates.begin(), panorama_candidates.end(),
+        [](const VLMWaypointCandidate& candidate) {
+          return candidate.reachable && candidate.has_projection;
+        });
+
+	    if (panorama_query_ok && panorama_decision.decision == "SELECT_WAYPOINT") {
+	      next_best_pos = panorama_selected.safe_goal;
+      next_best_path = panorama_selected.path;
+      rememberVLMScanRejectedCandidates(panorama_candidates, panorama_selected.id);
+      resetVLMScanContext("selected_initial_panorama_oracle_waypoint");
+      panorama_scan_context_reset = true;
+      rememberSelectedGoal(next_best_pos);
+      setActiveVLMWaypoint(panorama_decision.selected_id, next_best_pos, next_best_path,
+          panorama_selected.source == "target_object_proxy");
+      ROS_WARN("[FrontierOracle Initial Panorama] selected=%s final_goal=(%.2f, %.2f) from %zu view(s), candidates=%d",
+          panorama_decision.selected_id.c_str(), next_best_pos(0), next_best_pos(1),
+          vlm_initial_panorama_views_.size(), panorama_visible_candidate_count);
+      if (ep_->vlm_waypoint_debug_) {
+        writeVLMSelectionLog(panorama_request_id, panorama_candidates, panorama_decision,
+            next_best_pos, false, "", panorama_scan_context_reset);
+      }
+	      return;
+	    }
+
+    if (panorama_query_ok && panorama_decision.decision == "BLOCKED_DOWNSTAIRS") {
+      clearActiveVLMWaypoint("frontier_oracle_blocked_downstairs");
+      next_best_path.clear();
+      ROS_ERROR("[FrontierOracle Initial Panorama] blocked by no-downstairs constraint: %s",
+          panorama_decision.reason.c_str());
+      if (ep_->vlm_waypoint_debug_) {
+        writeVLMSelectionLog(panorama_request_id, panorama_candidates, panorama_decision,
+            Vector2d(0.0, 0.0), false, "", false);
+      }
+      return;
+    }
+
+	    if (panorama_query_ok && isVLMForcedLookDecision(panorama_decision.decision)) {
+      if (ep_->vlm_require_model_decision_ ||
+          vlm_scan_count_ < ep_->vlm_max_scan_steps_) {
+        updateVLMScanContext(panorama_decision, panorama_visible_candidate_count);
+        setPendingVLMForcedTurn(panorama_decision.decision);
+        ROS_WARN("[FrontierOracle Initial Panorama] requested scan action=%s reason=%s",
+            panorama_decision.decision.c_str(), panorama_decision.reason.c_str());
+        if (ep_->vlm_waypoint_debug_) {
+          writeVLMSelectionLog(panorama_request_id, panorama_candidates, panorama_decision,
+              Vector2d(0.0, 0.0), false, "", false);
+        }
+        return;
+      }
+      ROS_WARN("[FrontierOracle Initial Panorama] scan requested after max scan steps; falling back to current-view oracle.");
+    }
+    else if (!panorama_query_ok) {
+      ROS_WARN("[FrontierOracle Initial Panorama] invalid oracle result; falling back to current-view oracle: %s",
+          panorama_decision.fallback_reason.c_str());
+    }
+  }
+
+  if (ep_->vlm_initial_panorama_selection_enabled_ &&
+      !vlm_initial_panorama_consumed_ &&
+      !isOracleFrontierRolloutMode() &&
+      static_cast<int>(vlm_initial_panorama_views_.size()) >=
+          ep_->vlm_initial_panorama_min_views_) {
+    const string panorama_request_id = makeVLMRequestId();
+    vector<VLMWaypointCandidate> panorama_candidates;
+    bool panorama_fallback = false;
+    string panorama_fallback_reason;
+    bool panorama_scan_context_reset = false;
+    VLMDecisionResult panorama_decision;
+    VLMWaypointCandidate panorama_selected;
+
+    vlm_initial_panorama_consumed_ = true;
+    const bool panorama_query_ok = selectWaypointWithInitialPanoramaVLM(
+        panorama_request_id, cur_pos, cur_yaw, panorama_candidates, panorama_decision,
+        panorama_selected);
+    const int panorama_visible_candidate_count = std::count_if(
+        panorama_candidates.begin(), panorama_candidates.end(),
+        [](const VLMWaypointCandidate& candidate) {
+          return candidate.reachable && candidate.has_projection;
+        });
+
+    if (panorama_query_ok && panorama_decision.decision == "SELECT_WAYPOINT") {
+      next_best_pos = panorama_selected.safe_goal;
+      next_best_path = panorama_selected.path;
+      rememberVLMScanRejectedCandidates(panorama_candidates, panorama_selected.id);
+      resetVLMScanContext("selected_initial_panorama_waypoint");
+      panorama_scan_context_reset = true;
+      const Vector2d critic_nav_pos_before = next_best_pos;
+      const size_t critic_nav_path_size_before = next_best_path.size();
+      startCriticDecision(
+          panorama_request_id, panorama_decision, &panorama_selected, cur_pos, cur_yaw);
+      ROS_ASSERT_MSG((critic_nav_pos_before - next_best_pos).norm() < 1e-9 &&
+                         critic_nav_path_size_before == next_best_path.size(),
+          "[GTTrainingCritic] critic_only_debug changed navigation output");
+      rememberSelectedGoal(next_best_pos);
+      setActiveVLMWaypoint(panorama_decision.selected_id, next_best_pos, next_best_path,
+          panorama_selected.source == "target_object_proxy");
+      ROS_WARN("[VLM Initial Panorama] selected=%s final_goal=(%.2f, %.2f) from %zu view(s)",
+          panorama_decision.selected_id.c_str(), next_best_pos(0), next_best_pos(1),
+          vlm_initial_panorama_views_.size());
+      if (ep_->vlm_waypoint_debug_) {
+        writeVLMSelectionLog(panorama_request_id, panorama_candidates, panorama_decision,
+            next_best_pos, false, "", panorama_scan_context_reset);
+      }
+      return;
+    }
+
+    if (panorama_query_ok && isVLMForcedLookDecision(panorama_decision.decision)) {
+      if (ep_->vlm_require_model_decision_ ||
+          vlm_scan_count_ < ep_->vlm_max_scan_steps_) {
+        updateVLMScanContext(panorama_decision, panorama_visible_candidate_count);
+        setPendingVLMForcedTurn(panorama_decision.decision);
+        startCriticDecision(panorama_request_id, panorama_decision, nullptr, cur_pos, cur_yaw);
+        ROS_WARN("[VLM Initial Panorama] requested scan action=%s reason=%s",
+            panorama_decision.decision.c_str(), panorama_decision.reason.c_str());
+        if (ep_->vlm_waypoint_debug_) {
+          writeVLMSelectionLog(panorama_request_id, panorama_candidates, panorama_decision,
+              Vector2d(0.0, 0.0), false, "", false);
+        }
+        return;
+      }
+      panorama_fallback = true;
+      panorama_fallback_reason = "initial_panorama_requested_scan_after_max_scan_steps";
+    }
+    else {
+      panorama_fallback = true;
+      panorama_fallback_reason = panorama_decision.fallback_reason.empty()
+          ? "initial_panorama_invalid_vlm_result"
+          : panorama_decision.fallback_reason;
+    }
+
+    ROS_WARN("[VLM Initial Panorama] Falling back to current-view VLM selection: %s",
+        panorama_fallback_reason.c_str());
+    if (ep_->vlm_waypoint_debug_ && !panorama_candidates.empty()) {
+      panorama_decision.fallback = true;
+      panorama_decision.fallback_reason = panorama_fallback_reason;
+      writeVLMSelectionLog(panorama_request_id, panorama_candidates, panorama_decision,
+          Vector2d(0.0, 0.0), panorama_fallback, panorama_fallback_reason,
+          panorama_scan_context_reset);
+    }
+  }
+
+  const string request_id = makeVLMRequestId();
+  vector<VLMWaypointCandidate> candidates = buildVLMWaypointCandidates(cur_pos, cur_yaw, frontiers);
+  bool fallback = false;
+  string fallback_reason;
+  bool scan_context_reset = false;
+  VLMDecisionResult decision;
+  VLMWaypointCandidate selected;
+
+  const int visible_candidate_count = std::count_if(candidates.begin(), candidates.end(),
+      [](const VLMWaypointCandidate& candidate) {
+        return candidate.reachable && candidate.has_projection;
+      });
+  const bool no_visible_candidates = visible_candidate_count == 0;
+  ROS_WARN("[VLM Waypoint] Enter geometric exploration with %zu candidate(s), visible=%d",
+      candidates.size(), visible_candidate_count);
+  const bool require_model_decision = ep_->vlm_require_model_decision_;
+
+  auto abortStrictNoFallback = [&](const string& reason) {
+    decision.fallback = true;
+    decision.fallback_reason = reason;
+    ROS_ERROR("[VLM Strict] require_model_decision=true blocked fallback path: %s",
+        reason.c_str());
+    throw std::runtime_error("[VLM Strict] blocked fallback path: " + reason);
+  };
+
+	  auto fallbackToOriginalGeometric = [&](const string& reason) {
+	    if (require_model_decision)
+	      abortStrictNoFallback(reason);
+    fallback = true;
+    fallback_reason = reason;
+    resetVLMScanContext(reason);
+    scan_context_reset = true;
+    const bool force_original_geometric =
+        (reason == "max_scan_steps_reached" ||
+            reason == "max_scan_steps_reached_no_visible_candidates") &&
+        ep_->vlm_fallback_to_original_geometric_after_full_scan_;
+    if (!force_original_geometric && ep_->vlm_fallback_to_nearest_ && !candidates.empty()) {
+      const auto nearest_it = std::min_element(candidates.begin(), candidates.end(),
+          [](const VLMWaypointCandidate& a, const VLMWaypointCandidate& b) {
+            return a.path_length < b.path_length;
+          });
+      if (nearest_it != candidates.end()) {
+        next_best_pos = nearest_it->safe_goal;
+        next_best_path = nearest_it->path;
+        decision.selected_id = nearest_it->id;
+      }
+    }
+    if (next_best_path.empty()) {
+      findClosestFrontierPolicy(cur_pos, frontiers, next_best_pos, next_best_path);
+      decision.selected_id = "original_geometric";
+    }
+    if (decision.decision.empty())
+      decision.decision = "SELECT_WAYPOINT";
+    if (decision.reason.empty())
+      decision.reason = "fallback_to_original_geometric";
+    decision.fallback = true;
+	    decision.fallback_reason = reason;
+	  };
+
+  if (!isOracleFrontierRolloutMode() && vlm_scan_context_active_ &&
+      !vlm_scan_panorama_views_.empty() &&
+      vlm_scan_count_ >= ep_->vlm_max_scan_steps_) {
+    const string scan_choice_request_id = request_id + "_scan360";
+    vector<VLMWaypointCandidate> scan_candidates;
+    VLMDecisionResult scan_decision;
+    VLMWaypointCandidate scan_selected;
+    bool scan_choice_context_reset = false;
+    const bool scan_choice_ok = selectWaypointWithScanPanoramaVLM(
+        scan_choice_request_id, cur_pos, cur_yaw, scan_candidates, scan_decision,
+        scan_selected);
+    const size_t scan_view_count = vlm_scan_panorama_views_.size();
+
+    if (scan_choice_ok && scan_decision.decision == "SELECT_WAYPOINT") {
+      next_best_pos = scan_selected.safe_goal;
+      next_best_path = scan_selected.path;
+      rememberVLMScanRejectedCandidates(scan_candidates, scan_selected.id);
+      resetVLMScanContext("selected_full_scan_panorama_waypoint");
+      scan_choice_context_reset = true;
+      const Vector2d critic_nav_pos_before = next_best_pos;
+      const size_t critic_nav_path_size_before = next_best_path.size();
+      startCriticDecision(scan_choice_request_id, scan_decision, &scan_selected, cur_pos, cur_yaw);
+      ROS_ASSERT_MSG((critic_nav_pos_before - next_best_pos).norm() < 1e-9 &&
+                         critic_nav_path_size_before == next_best_path.size(),
+          "[GTTrainingCritic] critic_only_debug changed navigation output");
+      rememberSelectedGoal(next_best_pos);
+      setActiveVLMWaypoint(scan_decision.selected_id, next_best_pos, next_best_path,
+          scan_selected.source == "target_object_proxy");
+      ROS_WARN("[VLM Scan Panorama] full scan complete, selected=%s final_goal=(%.2f, %.2f) from %zu view(s), candidates=%zu",
+          scan_decision.selected_id.c_str(), next_best_pos(0), next_best_pos(1),
+          scan_view_count, scan_candidates.size());
+      if (ep_->vlm_waypoint_debug_) {
+        writeVLMSelectionLog(scan_choice_request_id, scan_candidates, scan_decision,
+            next_best_pos, false, "", scan_choice_context_reset);
+      }
+      return;
+    }
+
+    const string reason = scan_decision.fallback_reason.empty()
+        ? "full_scan_vlm_choice_failed"
+        : scan_decision.fallback_reason;
+    ROS_WARN("[VLM Scan Panorama] full-scan VLM choice failed: %s", reason.c_str());
+    if (require_model_decision)
+      abortStrictNoFallback(reason);
+    fallbackToOriginalGeometric(reason);
+    if (ep_->vlm_waypoint_debug_) {
+      Vector2d final_goal = next_best_path.empty() ? Vector2d(0.0, 0.0) : next_best_pos;
+      writeVLMSelectionLog(scan_choice_request_id, scan_candidates, decision, final_goal,
+          true, reason, scan_context_reset);
+    }
+    return;
+  }
+
+	  bool query_ok = false;
+	  if (!require_model_decision &&
+	      no_visible_candidates && vlm_scan_count_ >= ep_->vlm_max_scan_steps_) {
+    decision.decision = "SELECT_WAYPOINT";
+    decision.reason = "max_scan_steps_reached_no_visible_candidates";
+    fallbackToOriginalGeometric("max_scan_steps_reached_no_visible_candidates");
+  }
+  else {
+    if (isOracleFrontierRolloutMode()) {
+      query_ok = selectWaypointWithFrontierOracle(
+          request_id, cur_pos, cur_yaw, candidates, decision, selected);
+    }
+    else {
+      query_ok = selectWaypointWithVLM(
+          request_id, cur_pos, cur_yaw, candidates, decision, selected);
+    }
+
+    if (!query_ok) {
+      const string reason = decision.fallback_reason.empty() ? "invalid_vlm_result"
+                                                            : decision.fallback_reason;
+      if (require_model_decision) {
+        abortStrictNoFallback(reason);
+      }
+      else if (no_visible_candidates && vlm_scan_count_ < ep_->vlm_max_scan_steps_) {
+        decision = VLMDecisionResult();
+        decision.decision = "LOOK_LEFT_60";
+        decision.front_scene_type = "no_visible_projected_waypoint";
+	        decision.reason = "No visible waypoint candidates and VLM was unavailable or invalid; defaulting to LOOK_LEFT_60.";
+	        decision.fallback = false;
+	        decision.fallback_reason = reason.empty() ? "vlm_unavailable_or_invalid_no_visible_candidates_default_left" : reason;
+	        recordVLMScanPanoramaView(request_id, cur_pos, cur_yaw, candidates);
+	        updateVLMScanContext(decision, visible_candidate_count);
+	        setPendingVLMForcedTurn(decision.decision);
+        const Vector2d critic_nav_pos_before = next_best_pos;
+        const size_t critic_nav_path_size_before = next_best_path.size();
+        if (!isOracleFrontierRolloutMode())
+          startCriticDecision(request_id, decision, nullptr, cur_pos, cur_yaw);
+        ROS_ASSERT_MSG((critic_nav_pos_before - next_best_pos).norm() < 1e-9 &&
+                           critic_nav_path_size_before == next_best_path.size(),
+            "[GTTrainingCritic] critic_only_debug changed navigation output");
+        ROS_WARN("[VLM Scan] no visible candidates; selector failed (%s), defaulting to LOOK_LEFT_60 scan_count=%d/%d cumulative=%.1f",
+            decision.fallback_reason.c_str(), vlm_scan_count_, ep_->vlm_max_scan_steps_,
+            vlm_cumulative_scan_angle_deg_);
+      }
+      else {
+        fallbackToOriginalGeometric(reason);
+      }
+	    }
+	    else if (decision.decision == "SELECT_WAYPOINT") {
+	      next_best_pos = selected.safe_goal;
+      next_best_path = selected.path;
+      rememberVLMScanRejectedCandidates(candidates, selected.id);
+      resetVLMScanContext("selected_waypoint");
+      scan_context_reset = true;
+      const Vector2d critic_nav_pos_before = next_best_pos;
+      const size_t critic_nav_path_size_before = next_best_path.size();
+      if (!isOracleFrontierRolloutMode())
+        startCriticDecision(request_id, decision, &selected, cur_pos, cur_yaw);
+	      ROS_ASSERT_MSG((critic_nav_pos_before - next_best_pos).norm() < 1e-9 &&
+	                         critic_nav_path_size_before == next_best_path.size(),
+	          "[GTTrainingCritic] critic_only_debug changed navigation output");
+	    }
+    else if (decision.decision == "BLOCKED_DOWNSTAIRS") {
+      clearActiveVLMWaypoint("frontier_oracle_blocked_downstairs");
+      next_best_path.clear();
+      ROS_ERROR("[FrontierOracle] blocked by no-downstairs constraint: %s",
+          decision.reason.c_str());
+    }
+	    else if (isVLMForcedLookDecision(decision.decision)) {
+      if (!require_model_decision &&
+          vlm_scan_count_ >= ep_->vlm_max_scan_steps_) {
+        fallbackToOriginalGeometric(no_visible_candidates ?
+            "max_scan_steps_reached_no_visible_candidates" : "max_scan_steps_reached");
+      }
+	      else {
+	        if (!no_visible_candidates)
+	          rememberVLMScanRejectedCandidates(candidates, string());
+	        recordVLMScanPanoramaView(request_id, cur_pos, cur_yaw, candidates);
+	        updateVLMScanContext(decision, visible_candidate_count);
+	        setPendingVLMForcedTurn(decision.decision);
+        const Vector2d critic_nav_pos_before = next_best_pos;
+        const size_t critic_nav_path_size_before = next_best_path.size();
+        if (!isOracleFrontierRolloutMode())
+          startCriticDecision(request_id, decision, nullptr, cur_pos, cur_yaw);
+        ROS_ASSERT_MSG((critic_nav_pos_before - next_best_pos).norm() < 1e-9 &&
+                           critic_nav_path_size_before == next_best_path.size(),
+            "[GTTrainingCritic] critic_only_debug changed navigation output");
+        ROS_WARN("[VLM Scan] decision=%s reason=%s scan_count=%d/%d cumulative=%.1f visible=%d",
+            decision.decision.c_str(), decision.reason.c_str(), vlm_scan_count_,
+            ep_->vlm_max_scan_steps_, vlm_cumulative_scan_angle_deg_, visible_candidate_count);
+      }
+    }
+    else {
+      fallbackToOriginalGeometric("unknown_decision");
+    }
+  }
+
+  if (!isOracleFrontierRolloutMode())
+    writeActualCandidateReferenceLabel(request_id, cur_pos, cur_yaw, candidates, decision);
+
+  if (!next_best_path.empty()) {
+    if (!fallback) {
+      rememberSelectedGoal(next_best_pos);
+      setActiveVLMWaypoint(decision.selected_id, next_best_pos, next_best_path,
+          selected.source == "target_object_proxy");
+    }
+    ROS_WARN("[VLM Waypoint] selected=%s final_goal=(%.2f, %.2f) fallback=%s reason=%s",
+        decision.selected_id.c_str(), next_best_pos(0), next_best_pos(1),
+        fallback ? "true" : "false", fallback_reason.c_str());
+  }
+
+  if (ep_->vlm_waypoint_debug_) {
+    Vector2d final_goal = next_best_path.empty() ? Vector2d(0.0, 0.0) : next_best_pos;
+    writeVLMSelectionLog(request_id, candidates, decision, final_goal, fallback, fallback_reason,
+        scan_context_reset);
+  }
+}
+
+void ExplorationManager::findTSPTourPolicy(Vector2d cur_pos, vector<Vector2d> frontiers,
+    Vector2d& next_best_pos, vector<Vector2d>& next_best_path)
+{
+  next_best_path.clear();
+  vector<Vector2d> filter_frontiers;
+  for (auto frontier : frontiers) {
+    Vector2d tmp_pos;
+    vector<Vector2d> tmp_path;
+    if (searchFrontierPath(cur_pos, frontier, tmp_pos, tmp_path))
+      filter_frontiers.push_back(frontier);
+  }
+
+  vector<int> indices;
+  computeATSPTour(cur_pos, filter_frontiers, indices);
+  ed_->tsp_tour_.push_back(cur_pos);
+  for (auto idx : indices) ed_->tsp_tour_.push_back(filter_frontiers[idx]);
+
+  if (!indices.empty()) {
+    for (auto idx : indices) {
+      Vector2d next_bext_frontier = filter_frontiers[idx];
+      if (searchFrontierPath(cur_pos, next_bext_frontier, next_best_pos, next_best_path))
+        break;
+    }
+  }
+}
+
+double ExplorationManager::computePathCost(const Vector2d& pos1, const Vector2d& pos2)
+{
+  path_finder_->reset();
+  if (path_finder_->astarSearch(pos1, pos2, 0.25, 2.0, Astar2D::SAFETY_MODE::OPTIMISTIC) ==
+      Astar2D::REACH_END)
+    return Astar2D::pathLength(path_finder_->getPath());
+  return 10000.0;
+}
+
+void ExplorationManager::computeATSPCostMatrix(
+    const Vector2d& cur_pos, const vector<Vector2d>& frontiers, Eigen::MatrixXd& mat)
+{
+  int dimen = frontiers.size() + 1;
+  mat.resize(dimen, dimen);
+
+  // Agent to frontiers
+  for (int i = 1; i < dimen; i++) {
+    mat(0, i) = computePathCost(cur_pos, frontiers[i - 1]);
+    mat(i, 0) = 0;
+  }
+
+  // Costs between frontiers
+  for (int i = 1; i < dimen; ++i) {
+    for (int j = i + 1; j < dimen; ++j) {
+      double cost = computePathCost(frontiers[i - 1], frontiers[j - 1]);
+      mat(i, j) = cost;
+      mat(j, i) = cost;
+    }
+  }
+
+  // Diag
+  for (int i = 0; i < dimen; ++i) {
+    mat(i, i) = 100000.0;
+  }
+}
+
+void ExplorationManager::computeATSPTour(
+    const Vector2d& cur_pos, const vector<Vector2d>& frontiers, vector<int>& indices)
+{
+  indices.clear();
+  if (frontiers.empty()) {
+    ROS_ERROR("No frontier to compute tsp!");
+    return;
+  }
+  else if (frontiers.size() == 1) {
+    indices.push_back(0);
+    return;
+  }
+  /* change ATSP to lhk3 */
+  auto t1 = ros::Time::now();
+
+  // Get cost matrix for current state and clusters
+  Eigen::MatrixXd cost_mat;
+  computeATSPCostMatrix(cur_pos, frontiers, cost_mat);
+  const int dimension = cost_mat.rows();
+
+  double mat_time = (ros::Time::now() - t1).toSec();
+  t1 = ros::Time::now();
+
+  // Initialize ATSP par file
+  // Create problem file
+  ofstream file(ep_->tsp_dir_ + "/atsp_tour.atsp");
+  file << "NAME : amtsp\n";
+  file << "TYPE : ATSP\n";
+  file << "DIMENSION : " + to_string(dimension) + "\n";
+  file << "EDGE_WEIGHT_TYPE : EXPLICIT\n";
+  file << "EDGE_WEIGHT_FORMAT : FULL_MATRIX\n";
+  file << "EDGE_WEIGHT_SECTION\n";
+  for (int i = 0; i < dimension; ++i) {
+    for (int j = 0; j < dimension; ++j) {
+      int int_cost = 100 * cost_mat(i, j);
+      file << int_cost << " ";
+    }
+    file << "\n";
+  }
+  file.close();
+
+  // Create par file
+  const int drone_num = 1;
+  file.open(ep_->tsp_dir_ + "/atsp_tour.par");
+  file << "SPECIAL\n";
+  file << "PROBLEM_FILE = " + ep_->tsp_dir_ + "/atsp_tour.atsp\n";
+  file << "SALESMEN = " << to_string(drone_num) << "\n";
+  file << "MTSP_OBJECTIVE = MINSUM\n";
+  file << "RUNS = 1\n";
+  file << "TRACE_LEVEL = 0\n";
+  file << "TOUR_FILE = " + ep_->tsp_dir_ + "/atsp_tour.tour\n";
+  file.close();
+
+  auto par_dir = ep_->tsp_dir_ + "/atsp_tour.atsp";
+
+  lkh_mtsp_solver::SolveMTSP srv;
+  srv.request.prob = 1;
+  if (!tsp_client_.call(srv)) {
+    ROS_ERROR("Fail to solve ATSP.");
+    return;
+  }
+
+  // Read optimal tour from the tour section of result file
+  ifstream res_file(ep_->tsp_dir_ + "/atsp_tour.tour");
+  string res;
+  while (getline(res_file, res)) {
+    // Go to tour section
+    if (res.compare("TOUR_SECTION") == 0)
+      break;
+  }
+
+  // Read path for ATSP formulation
+  while (getline(res_file, res)) {
+    // Read indices of frontiers in optimal tour
+    int id = stoi(res);
+    if (id == 1)  // Ignore the current state
+      continue;
+    if (id == -1)
+      break;
+    indices.push_back(id - 2);  // Idx of solver-2 == Idx of frontier
+  }
+
+  res_file.close();
+
+  // for (auto idx : indices) ROS_WARN("ATSP idx = %d", idx);
+
+  double tsp_time = (ros::Time::now() - t1).toSec();
+  ROS_WARN("[ATSP Tour] Cost mat: %lf, TSP: %lf", mat_time, tsp_time);
+}
+
+Vector2d ExplorationManager::findNearestObjectPoint(
+    const Vector3d& start, const pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>& object_cloud)
+{
+  pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
+  kdtree.setInputCloud(object_cloud);
+  std::vector<int> pointIdxNKNSearch(1);
+  std::vector<float> pointNKNSquaredDistance(1);
+
+  pcl::PointXYZ cur_pt;
+  cur_pt.x = start(0);
+  cur_pt.y = start(1);
+  cur_pt.z = start(2);
+
+  if (kdtree.nearestKSearch(cur_pt, 1, pointIdxNKNSearch, pointNKNSquaredDistance) <= 0) {
+    ROS_ERROR("[Bug] No nearest object point found.");
+    return Vector2d(-1000.0, -1000.0);  // Error indicator
+  }
+
+  int nearest_idx = pointIdxNKNSearch[0];
+  auto nearest_point = object_cloud->points[nearest_idx];
+  return Vector2d(nearest_point.x, nearest_point.y);
+}
+
+bool ExplorationManager::trySearchObjectPathWithDistance(const Vector2d& start2d,
+    const Vector2d& object_pose, double distance, double max_search_time,
+    Eigen::Vector2d& refined_pos, std::vector<Eigen::Vector2d>& refined_path,
+    const std::string& debug_msg)
+{
+  path_finder_->reset();
+  if (path_finder_->astarSearch(start2d, object_pose, distance, max_search_time) ==
+      Astar2D::REACH_END) {
+    std::vector<Eigen::Vector2d> path = path_finder_->getPath();
+    Vector2d tmp_pos(-1000.0, -1000.0);
+
+    // Find valid position along the path (from end to start)
+    for (int i = path.size() - 1; i >= 0; i--) {
+      if (sdf_map_->getOccupancy(path[i]) != SDFMap2D::OCCUPIED &&
+          sdf_map_->getOccupancy(path[i]) != SDFMap2D::UNKNOWN &&
+          sdf_map_->getInflateOccupancy(path[i]) != 1) {
+        tmp_pos = path[i];
+        break;
+      }
+    }
+
+    // Search path to the valid position
+    path_finder_->reset();
+    if (path_finder_->astarSearch(start2d, tmp_pos, 0.2, max_search_time) == Astar2D::REACH_END) {
+      refined_path = path_finder_->getPath();
+      refined_pos = tmp_pos;
+      if (!debug_msg.empty()) {
+        ROS_WARN("%s", debug_msg.c_str());
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+bool ExplorationManager::searchObjectPath(const Vector3d& start,
+    const pcl::shared_ptr<pcl::PointCloud<pcl::PointXYZ>>& object_cloud,
+    Eigen::Vector2d& refined_pos, std::vector<Eigen::Vector2d>& refined_path)
+{
+  const double max_search_time = 0.2;  // Maximum planning time per attempt
+  Vector2d start2d = Vector2d(start(0), start(1));
+
+  // Find nearest accessible point in object cloud
+  Vector2d object_pose = findNearestObjectPoint(start, object_cloud);
+  if (object_pose.x() < -999.0)
+    return false;  // Error indicator from findNearestObjectPoint
+
+  // Try different safety distances in order of preference
+  const std::vector<double> distances = { 0.5, 0.70, 0.85 };
+  const std::vector<std::string> debug_messages = { "I'm going to the object! dist = 0.5m!",
+    "I'm going to the object! dist = 0.70m!", "I'm going to the object! dist = 0.85m!" };
+
+  // Attempt path planning with each safety distance
+  for (size_t i = 0; i < distances.size(); ++i) {
+    if (trySearchObjectPathWithDistance(start2d, object_pose, distances[i], max_search_time,
+            refined_pos, refined_path, debug_messages[i])) {
+      return true;
+    }
+  }
+
+  ROS_ERROR("Failed to find object path.");
+  return false;
+}
+
+void ExplorationManager::getSortedSemanticFrontiers(const Vector2d& cur_pos,
+    const vector<Vector2d>& frontiers, vector<SemanticFrontier>& sem_frontiers)
+{
+  // Filter and sort frontiers based on semantic values and reachability
+  sem_frontiers.clear();
+
+  for (auto& frontier : frontiers) {
+    SemanticFrontier sem_frontier;
+    sem_frontier.position = frontier;
+
+    // Compute semantic value from local neighborhood
+    Vector2i idx;
+    sdf_map_->posToIndex(frontier, idx);
+    auto nbrs = allNeighbors(idx, 2);  // 5x5 grid neighborhood
+    double value = sdf_map_->value_map_->getValue(idx);
+
+    // Find maximum semantic value in neighborhood (ignoring occupied cells)
+    for (auto& nbr : nbrs) {
+      if (sdf_map_->getInflateOccupancy(nbr) == 1 ||
+          sdf_map_->getOccupancy(nbr) == SDFMap2D::OCCUPIED)
+        continue;
+      value = std::max(value, sdf_map_->value_map_->getValue(nbr));
+    }
+    sem_frontier.semantic_value = value;
+
+    // Validate reachability and compute path cost
+    Vector2d tmp_pos;
+    vector<Vector2d> tmp_path;
+    if (!searchFrontierPath(cur_pos, frontier, tmp_pos, tmp_path)) {
+      // Assign high cost penalty for unreachable frontiers
+      sem_frontier.path_length = 1000000;
+      sem_frontier.path.clear();
+    }
+    else {
+      sem_frontier.path_length = Astar2D::pathLength(tmp_path);
+      sem_frontier.path = tmp_path;
+    }
+
+    // Only include frontiers with valid paths
+    if (!sem_frontier.path.empty())
+      sem_frontiers.push_back(sem_frontier);
+  }
+
+  // Sort by semantic value (desc) then by path length (asc)
+  std::sort(sem_frontiers.begin(), sem_frontiers.end());
+}
+
+void ExplorationManager::calcSemanticFrontierInfo(const vector<SemanticFrontier>& sem_frontiers,
+    double& std_dev, double& max_to_mean, double& mean, bool if_print)
+{
+  // Handle empty frontier list
+  if (sem_frontiers.empty()) {
+    std::cout << "No semantic frontiers available." << std::endl;
+    max_to_mean = 1.0;  // Neutral ratio
+    std_dev = 0.0;      // No variation
+    return;
+  }
+
+  // Compute mean and maximum semantic values
+  double sum = 0.0;
+  double max_value = 0.0;
+  for (const auto& frontier : sem_frontiers) {
+    sum += frontier.semantic_value;
+    max_value = max(max_value, frontier.semantic_value);
+  }
+  mean = sum / sem_frontiers.size();
+
+  // Compute standard deviation
+  double variance_sum = 0.0;
+  for (const auto& frontier : sem_frontiers)
+    variance_sum += (frontier.semantic_value - mean) * (frontier.semantic_value - mean);
+
+  max_to_mean = max_value / mean;
+  std_dev = std::sqrt(variance_sum / sem_frontiers.size());
+
+  // Print summary statistics
+  std::cout << "Mean Value: " << std::fixed << std::setprecision(3) << mean;
+  std::cout << " , Standard Deviation: " << std::fixed << std::setprecision(3) << std_dev;
+  std::cout << " , Max-to-Mean: " << std::fixed << std::setprecision(3) << max_to_mean << std::endl;
+
+  // Print detailed frontier values if requested
+  if (if_print) {
+    for (const auto& sem_frontier : sem_frontiers)
+      std::cout << "Value: " << std::fixed << std::setprecision(3) << sem_frontier.semantic_value
+                << std::endl;
+  }
+}
+
+bool ExplorationManager::planTrajectory(
+    const Eigen::VectorXd& start, const Eigen::VectorXd& end, const Vector3d& ctrl)
+{
+  if (!gcopter_ || !kinoastar_) {
+    ROS_WARN_THROTTLE(1.0, "[ExplorationManager] GCopter or KinoAstar not initialized for real-world mode");
+    return false;
+  }
+  
+  Eigen::VectorXd goal_state, current_state;
+  Vector3d control = ctrl;
+  goal_state = end;
+  current_state = start;
+
+  // Kinodynamic A* search
+  kinoastar_->reset();
+  kinoastar_->search(goal_state, current_state, control);
+  kinoastar_->getKinoNode();
+  
+  if (kinoastar_->has_path_) {
+    kinoastar_->kinoastarFlatPathPub(kinoastar_->flat_trajs_);
+    gcopter_->minco_plan();
+    std::vector<Trajectory<7, 3>> final_trajes = gcopter_->final_trajes;
+    gcopter_->mincoPathPub(gcopter_->final_trajes, gcopter_->final_singuls);
+    return true;
+  }
+  
+  return false;
+}
+
+}  // namespace apexnav_planner

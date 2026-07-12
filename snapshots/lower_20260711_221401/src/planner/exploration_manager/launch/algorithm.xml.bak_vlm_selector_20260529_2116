@@ -1,0 +1,218 @@
+<launch>
+    <arg name="map_size_x_"/>
+    <arg name="map_size_y_"/>
+
+    <arg name="odometry_topic_"/>
+    <arg name="sensor_pose_topic_"/>
+    <arg name="depth_topic_"/>
+
+    <arg name="cx_"/>
+    <arg name="cy_"/>
+    <arg name="fx_"/>
+    <arg name="fy_"/>
+
+    <!-- Real-world mode flag (default to false for simulation) -->
+    <arg name="is_real_world_" default="false"/>
+
+    <!-- main node -->
+    <node pkg="exploration_manager" name="exploration_node" type="exploration_node" output="screen">
+        <!-- Load trajectory planning parameters for real-world mode (Only Trajectory Use) -->
+        <rosparam file="$(find trajectory_manager)/config/planning_param.yaml" command="load" />
+
+        <remap from ="/odom_world"    to = "$(arg odometry_topic_)"/>
+        <remap from ="/map_ros/pose"  to = "$(arg sensor_pose_topic_)"/>
+        <remap from ="/map_ros/depth" to = "$(arg depth_topic_)"/>
+
+        <!-- FSM mode selection -->
+        <param name="is_real_world" value="$(arg is_real_world_)" type="bool"/>
+        
+        <!-- Mapping -->
+        <!-- ray_mode = 0: penetrate ; ray_mode = 1: non-penetrate -->
+        <param name="sdf_map/ray_mode" value="0" />
+        <param name="sdf_map/resolution" value="0.05" />
+        <param name="sdf_map/map_size_x" value="$(arg map_size_x_)" />
+        <param name="sdf_map/map_size_y" value="$(arg map_size_y_)" />
+        <param name="sdf_map/obstacles_inflation" value="0.18" />
+        <param name="sdf_map/local_bound" value="5.0"/>
+
+        <param name="sdf_map/p_hit" value="0.90"/>
+        <param name="sdf_map/p_miss" value="0.48"/>
+        <param name="sdf_map/p_min" value="0.10"/>
+        <param name="sdf_map/p_max" value="0.98"/>
+        <param name="sdf_map/p_occ" value="0.80"/>
+        <param name="sdf_map/max_ray_length" value="4.99"/>
+        <param name="sdf_map/optimistic" value="false" type="bool"/>
+        <param name="sdf_map/signed_dist" value="false" type="bool"/>
+
+        <param name="map_ros/cx" value="$(arg cx_)"/>
+        <param name="map_ros/cy" value="$(arg cy_)"/>
+        <param name="map_ros/fx" value="$(arg fx_)"/>
+        <param name="map_ros/fy" value="$(arg fy_)"/>
+        <param name="map_ros/depth_filter_maxdist" value="4.99"/>
+        <param name="map_ros/depth_filter_mindist" value="0.0"/>
+        <param name="map_ros/depth_filter_margin" value="2"/>
+        <param name="map_ros/filter_min_height" value="0.28"/>
+        <param name="map_ros/filter_max_height" value="1.18"/>
+        <param name="map_ros/k_depth_scaling_factor" value="65535.0"/>
+        <param name="map_ros/skip_pixel" value="1"/>
+        <param name="map_ros/frame_id" value="world"/>
+        <param name="map_ros/virtual_ground_height" value="-0.34"/>
+
+        <!-- Exploration manager -->
+        <!-- 0: distance 1: semantic 2: hybrid(TSP sem + closest dist) 3: TSP(distance) -->
+        <param name="exploration/policy" value="2" type="int"/>
+        <param name="exploration/sigma_threshold" value="0.015" type="double"/>
+        <param name="exploration/max_to_mean_threshold" value="1.10" type="double"/>
+        <param name="exploration/max_to_mean_percentage" value="0.90" type="double"/>
+        <param name="exploration/tsp_dir" value="$(find lkh_mtsp_solver)/resource" type="string"/>
+        <param name="exploration/use_semantic_exploration" value="false" type="bool"/>
+
+        <!-- VLM-guided geometric exploration. Set use_vlm_guided_geometric=false for original closest-frontier baseline. -->
+        <param name="exploration/use_vlm_guided_geometric" value="true" type="bool"/>
+        <param name="exploration/vlm_waypoint_debug" value="true" type="bool"/>
+        <param name="exploration/vlm_max_candidates" value="6" type="int"/>
+        <param name="exploration/vlm_min_candidates" value="2" type="int"/>
+        <param name="exploration/vlm_fallback_to_nearest" value="true" type="bool"/>
+        <param name="exploration/vlm_hold_selected_goal" value="true" type="bool"/>
+        <param name="exploration/vlm_look_angle_deg" value="60" type="double"/>
+        <param name="exploration/vlm_max_scan_steps" value="6" type="int"/>
+        <param name="exploration/vlm_default_uncertain_turn" value="left" type="string"/>
+        <param name="exploration/vlm_use_local_view_candidates" value="true" type="bool"/>
+        <param name="exploration/vlm_local_view_hfov_deg" value="79.0" type="double"/>
+        <param name="exploration/vlm_local_view_rays_per_sector" value="7" type="int"/>
+        <param name="exploration/vlm_local_view_pixel_window" value="9" type="int"/>
+        <param name="exploration/vlm_local_view_sector_front_min_deg" value="-15.0" type="double"/>
+        <param name="exploration/vlm_local_view_sector_front_max_deg" value="15.0" type="double"/>
+        <param name="exploration/vlm_local_view_sector_left_front_min_deg" value="10.0" type="double"/>
+        <param name="exploration/vlm_local_view_sector_left_front_max_deg" value="39.5" type="double"/>
+        <param name="exploration/vlm_local_view_sector_right_front_min_deg" value="-39.5" type="double"/>
+        <param name="exploration/vlm_local_view_sector_right_front_max_deg" value="-10.0" type="double"/>
+        <param name="exploration/vlm_local_view_min_candidate_dist" value="0.6" type="double"/>
+        <param name="exploration/vlm_local_view_preferred_candidate_dist" value="1.1" type="double"/>
+        <param name="exploration/vlm_local_view_max_candidate_dist" value="1.6" type="double"/>
+        <param name="exploration/vlm_local_view_safety_margin" value="0.20" type="double"/>
+        <param name="exploration/vlm_local_view_min_clearance" value="0.18" type="double"/>
+        <param name="exploration/vlm_local_view_path_ratio_max" value="1.8" type="double"/>
+        <param name="exploration/vlm_local_view_astar_max_time" value="0.5" type="double"/>
+        <param name="exploration/vlm_local_view_boundary_margin_m" value="0.20" type="double"/>
+        <param name="exploration/vlm_local_view_depth_row_min_ratio" value="0.45" type="double"/>
+        <param name="exploration/vlm_local_view_depth_row_max_ratio" value="0.85" type="double"/>
+        <param name="exploration/vlm_fallback_to_original_geometric_after_full_scan" value="true" type="bool"/>
+        <param name="exploration/vlm_goal_reached_distance" value="0.15" type="double"/>
+        <param name="exploration/vlm_goal_max_follow_steps" value="80" type="int"/>
+        <param name="exploration/vlm_min_candidate_distance" value="0.35" type="double"/>
+        <param name="exploration/vlm_max_candidate_distance" value="8.0" type="double"/>
+        <param name="exploration/vlm_candidate_merge_distance" value="0.0" type="double"/>
+        <param name="exploration/vlm_min_clearance" value="0.10" type="double"/>
+        <param name="exploration/vlm_min_candidate_clearance_m" value="0.0" type="double"/>
+        <param name="exploration/vlm_scan_reject_candidate_radius" value="0.2" type="double"/>
+        <param name="exploration/vlm_rgb_topic" value="/habitat/camera_rgb_raw" type="string"/>
+        <param name="exploration/vlm_depth_topic" value="/habitat/camera_depth" type="string"/>
+        <param name="exploration/vlm_camera_height" value="0.88" type="double"/>
+        <param name="exploration/vlm_debug_dir" value="/root/autodl-tmp/Agent-apexnav/debug" type="string"/>
+        <param name="exploration/vlm_selector_script" value="/root/autodl-tmp/Agent-apexnav/vlm_waypoint_selector.py" type="string"/>
+        <param name="exploration/vlm_python_executable" value="python3" type="string"/>
+
+        <param name="reflection/mode" value="normal" type="string"/>
+        <param name="reflection/critic_only_debug/enabled" value="false" type="bool"/>
+        <param name="reflection/critic_only_debug/log_dir" value="logs/critic_debug" type="string"/>
+        <param name="reflection/critic_only_debug/positive_progress_threshold" value="0.25" type="double"/>
+        <param name="reflection/critic_only_debug/negative_progress_threshold" value="-0.25" type="double"/>
+        <param name="reflection/critic_only_debug/path_deviation_threshold" value="0.8" type="double"/>
+        <param name="reflection/critic_only_debug/prefer_geodesic_distance" value="true" type="bool"/>
+        <param name="oracle_frontier_rollout/enabled" value="$(optenv APEXNAV_ORACLE_FRONTIER_ENABLED false)" type="bool"/>
+        <param name="oracle_frontier_rollout/log_dir" value="$(optenv APEXNAV_ORACLE_FRONTIER_LOG_DIR logs/oracle_frontier_rollout)" type="string"/>
+        <param name="oracle_frontier_rollout/response_timeout" value="5.0" type="double"/>
+        <param name="oracle_frontier_rollout/detour_tolerance" value="1.0" type="double"/>
+        <param name="oracle_frontier_rollout/success_distance" value="0.2" type="double"/>
+        <param name="oracle_frontier_rollout/reject_downstairs" value="true" type="bool"/>
+        <param name="oracle_frontier_rollout/max_downward_drop_m" value="0.35" type="double"/>
+
+        <param name="frontier/cluster_min" value="2" type="int"/>
+        <param name="frontier/cluster_size_xy" value="0.65" type="double"/>
+        <param name="frontier/min_view_finish_fraction" value="0.2" type="double"/>
+        <param name="frontier/min_contain_unknown" value="30" type="int"/>
+
+        <param name="object/min_observation_num" value="2" type="int"/>
+        <!-- 0: no_fusion 1: ours_fusion 2: max_fusion-->
+        <param name="object/fusion_type" value="1" type="int"/>
+        <param name="object/use_observation" value="true" type="bool"/>
+        <param name="object/vis_cloud" value="true" type="bool"/>
+
+        <!-- Perception utils -->
+        <param name="perception_utils/left_angle" value="$(eval 30 * 3.1415926 / 180.0)" type="double"/>
+        <param name="perception_utils/right_angle" value="$(eval 30 * 3.1415926 / 180.0)" type="double"/>
+        <param name="perception_utils/max_dist" value="4.0" type="double"/>
+        <param name="perception_utils/vis_dist" value="1.0" type="double"/>
+
+        <!-- path searching -->
+        <param name="astar/lambda_heu" value="1.0" type="double"/>
+        <param name="astar/resolution_astar" value="0.1" type="double"/>
+    </node>
+
+    <!-- ATSP solver -->
+    <node pkg="lkh_mtsp_solver" name="tsp_solver" type="tsp_node" output="log">
+        <param name="exploration/tsp_dir" value="$(find lkh_mtsp_solver)/resource" type="string"/>
+        <param name="exploration/use_semantic_exploration" value="false" type="bool"/>
+
+        <!-- VLM-guided geometric exploration. Set use_vlm_guided_geometric=false for original closest-frontier baseline. -->
+        <param name="exploration/use_vlm_guided_geometric" value="true" type="bool"/>
+        <param name="exploration/vlm_waypoint_debug" value="true" type="bool"/>
+        <param name="exploration/vlm_max_candidates" value="6" type="int"/>
+        <param name="exploration/vlm_min_candidates" value="2" type="int"/>
+        <param name="exploration/vlm_fallback_to_nearest" value="true" type="bool"/>
+        <param name="exploration/vlm_hold_selected_goal" value="true" type="bool"/>
+        <param name="exploration/vlm_look_angle_deg" value="60" type="double"/>
+        <param name="exploration/vlm_max_scan_steps" value="6" type="int"/>
+        <param name="exploration/vlm_default_uncertain_turn" value="left" type="string"/>
+        <param name="exploration/vlm_use_local_view_candidates" value="true" type="bool"/>
+        <param name="exploration/vlm_local_view_hfov_deg" value="79.0" type="double"/>
+        <param name="exploration/vlm_local_view_rays_per_sector" value="7" type="int"/>
+        <param name="exploration/vlm_local_view_pixel_window" value="9" type="int"/>
+        <param name="exploration/vlm_local_view_sector_front_min_deg" value="-15.0" type="double"/>
+        <param name="exploration/vlm_local_view_sector_front_max_deg" value="15.0" type="double"/>
+        <param name="exploration/vlm_local_view_sector_left_front_min_deg" value="10.0" type="double"/>
+        <param name="exploration/vlm_local_view_sector_left_front_max_deg" value="39.5" type="double"/>
+        <param name="exploration/vlm_local_view_sector_right_front_min_deg" value="-39.5" type="double"/>
+        <param name="exploration/vlm_local_view_sector_right_front_max_deg" value="-10.0" type="double"/>
+        <param name="exploration/vlm_local_view_min_candidate_dist" value="0.6" type="double"/>
+        <param name="exploration/vlm_local_view_preferred_candidate_dist" value="1.1" type="double"/>
+        <param name="exploration/vlm_local_view_max_candidate_dist" value="1.6" type="double"/>
+        <param name="exploration/vlm_local_view_safety_margin" value="0.20" type="double"/>
+        <param name="exploration/vlm_local_view_min_clearance" value="0.18" type="double"/>
+        <param name="exploration/vlm_local_view_path_ratio_max" value="1.8" type="double"/>
+        <param name="exploration/vlm_local_view_astar_max_time" value="0.5" type="double"/>
+        <param name="exploration/vlm_local_view_boundary_margin_m" value="0.20" type="double"/>
+        <param name="exploration/vlm_local_view_depth_row_min_ratio" value="0.45" type="double"/>
+        <param name="exploration/vlm_local_view_depth_row_max_ratio" value="0.85" type="double"/>
+        <param name="exploration/vlm_fallback_to_original_geometric_after_full_scan" value="true" type="bool"/>
+        <param name="exploration/vlm_goal_reached_distance" value="0.15" type="double"/>
+        <param name="exploration/vlm_goal_max_follow_steps" value="80" type="int"/>
+        <param name="exploration/vlm_min_candidate_distance" value="0.35" type="double"/>
+        <param name="exploration/vlm_max_candidate_distance" value="8.0" type="double"/>
+        <param name="exploration/vlm_candidate_merge_distance" value="0.0" type="double"/>
+        <param name="exploration/vlm_min_clearance" value="0.10" type="double"/>
+        <param name="exploration/vlm_min_candidate_clearance_m" value="0.0" type="double"/>
+        <param name="exploration/vlm_scan_reject_candidate_radius" value="0.2" type="double"/>
+        <param name="exploration/vlm_rgb_topic" value="/habitat/camera_rgb_raw" type="string"/>
+        <param name="exploration/vlm_depth_topic" value="/habitat/camera_depth" type="string"/>
+        <param name="exploration/vlm_camera_height" value="0.88" type="double"/>
+        <param name="exploration/vlm_debug_dir" value="/root/autodl-tmp/Agent-apexnav/debug" type="string"/>
+        <param name="exploration/vlm_selector_script" value="/root/autodl-tmp/Agent-apexnav/vlm_waypoint_selector.py" type="string"/>
+        <param name="exploration/vlm_python_executable" value="python3" type="string"/>
+        <param name="reflection/mode" value="normal" type="string"/>
+        <param name="reflection/critic_only_debug/enabled" value="false" type="bool"/>
+        <param name="reflection/critic_only_debug/log_dir" value="logs/critic_debug" type="string"/>
+        <param name="reflection/critic_only_debug/positive_progress_threshold" value="0.25" type="double"/>
+        <param name="reflection/critic_only_debug/negative_progress_threshold" value="-0.25" type="double"/>
+        <param name="reflection/critic_only_debug/path_deviation_threshold" value="0.8" type="double"/>
+        <param name="reflection/critic_only_debug/prefer_geodesic_distance" value="true" type="bool"/>
+        <param name="oracle_frontier_rollout/enabled" value="$(optenv APEXNAV_ORACLE_FRONTIER_ENABLED false)" type="bool"/>
+        <param name="oracle_frontier_rollout/log_dir" value="$(optenv APEXNAV_ORACLE_FRONTIER_LOG_DIR logs/oracle_frontier_rollout)" type="string"/>
+        <param name="oracle_frontier_rollout/response_timeout" value="5.0" type="double"/>
+        <param name="oracle_frontier_rollout/detour_tolerance" value="1.0" type="double"/>
+        <param name="oracle_frontier_rollout/success_distance" value="0.2" type="double"/>
+        <param name="oracle_frontier_rollout/reject_downstairs" value="true" type="bool"/>
+        <param name="oracle_frontier_rollout/max_downward_drop_m" value="0.35" type="double"/>
+    </node>
+</launch>

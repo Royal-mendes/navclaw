@@ -1,0 +1,4 @@
+source=/home/ubuntu/papers_repro/mapgpt_onmyagentnav
+snapshot_created_at=2026-07-11T22:14:01+08:00
+scope=lower_navigation_source_only
+excluded=mapgpt_upper_framework.py,vlm_waypoint_selector.py,logs,debug,build,devel,backup,data,weights,third_party
