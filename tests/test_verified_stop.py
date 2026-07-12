@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ from navclaw.stop_gate import evaluate_stop_gate
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER_PATH = ROOT / "bridge" / "frontier_only_selector.py"
 PATCHER_PATH = ROOT / "scripts" / "apply_verified_stop_patch.py"
+PINNED_LOWER = ROOT / "snapshots" / "lower_20260711_221401"
 
 wrapper_spec = importlib.util.spec_from_file_location(
     "frontier_only_selector_verified_stop", WRAPPER_PATH
@@ -131,22 +133,41 @@ class LowerStopPatcherTests(unittest.TestCase):
             encoding="utf-8",
         )
 
+    def assert_patched(self, root):
+        header = (root / patcher.HEADER_REL).read_text(encoding="utf-8")
+        manager = (root / patcher.MANAGER_REL).read_text(encoding="utf-8")
+        fsm = (root / patcher.FSM_REL).read_text(encoding="utf-8")
+        self.assertIn("consumePendingVLMStopRequest", header)
+        self.assertIn('decision.decision == "STOP"', manager)
+        self.assertIn("pending_vlm_stop_request_ = true", manager)
+        self.assertIn("FINAL_RESULT::REACH_OBJECT", fsm)
+
     def test_patches_lower_layer_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.write_fixture(root)
             first = patcher.patch_workspace(root)
             self.assertEqual(len(first["changed_files"]), 3)
-            header = (root / patcher.HEADER_REL).read_text(encoding="utf-8")
-            manager = (root / patcher.MANAGER_REL).read_text(encoding="utf-8")
-            fsm = (root / patcher.FSM_REL).read_text(encoding="utf-8")
-            self.assertIn("consumePendingVLMStopRequest", header)
-            self.assertIn('decision.decision == "STOP"', manager)
-            self.assertIn("pending_vlm_stop_request_ = true", manager)
-            self.assertIn("FINAL_RESULT::REACH_OBJECT", fsm)
+            self.assert_patched(root)
             second = patcher.patch_workspace(root)
             self.assertEqual(len(second["changed_files"]), 0)
             self.assertEqual(len(second["already_patched_files"]), 3)
+
+    def test_patches_pinned_apexnav_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative in (
+                patcher.HEADER_REL,
+                patcher.MANAGER_REL,
+                patcher.FSM_REL,
+            ):
+                source = PINNED_LOWER / relative
+                destination = root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination)
+            summary = patcher.patch_workspace(root)
+            self.assertEqual(len(summary["changed_files"]), 3)
+            self.assert_patched(root)
 
 
 if __name__ == "__main__":
