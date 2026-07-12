@@ -54,24 +54,42 @@ class SkillRegistry:
         if allow_look:
             skills.extend(
                 [
-                SkillDefinition(
-                    name="look_left_60",
-                    description="Rotate left by 60 degrees to obtain a new observation.",
-                    input_schema={"type": "object", "properties": {}, "additionalProperties": False},
-                ),
-                SkillDefinition(
-                    name="look_right_60",
-                    description="Rotate right by 60 degrees to obtain a new observation.",
-                    input_schema={"type": "object", "properties": {}, "additionalProperties": False},
-                ),
+                    SkillDefinition(
+                        name="look_left_60",
+                        description="Rotate left by 60 degrees to obtain a new observation.",
+                        input_schema={
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": False,
+                        },
+                    ),
+                    SkillDefinition(
+                        name="look_right_60",
+                        description="Rotate right by 60 degrees to obtain a new observation.",
+                        input_schema={
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": False,
+                        },
+                    ),
                 ]
             )
         if allow_stop:
             skills.append(
                 SkillDefinition(
                     name="stop",
-                    description="Stop only when the environment contract explicitly supports STOP.",
-                    input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+                    description=(
+                        "Request episode termination only when the current RGB clearly shows "
+                        "the task target. This skill is exposed only after lower-layer target "
+                        "category, confidence, distance, view-angle, and repeated-observation "
+                        "checks have passed. STOP is a request for final environment handling, "
+                        "not an unsupported claim of success."
+                    ),
+                    input_schema={
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
                 )
             )
         return skills
